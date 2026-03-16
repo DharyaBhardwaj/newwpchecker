@@ -1,0 +1,7 @@
+project_id = "bzanrtbstsccvsbbpmpr"
+
+[functions.whatsapp-checker]
+verify_jwt = false
+
+[functions.render-keepalive]
+verify_jwt = false
