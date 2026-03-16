@@ -611,10 +611,47 @@ bot.on('callback_query', async (query) => {
     if (cbData.startsWith('wa_connect_')) {
       if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
       const accountId = cbData.replace('wa_connect_', '');
-      await bot.answerCallbackQuery(queryId, { text: '⏳ Connecting...' });
-      connectAccount(accountId); // non-blocking
-      await sleep(1200);
-      return handleWaAccounts(chatId, messageId);
+      await bot.answerCallbackQuery(queryId, { text: '⏳ QR generate ho raha hai...' });
+
+      // Status message bhejo
+      const statusMsg = await bot.sendMessage(chatId, '⏳ WhatsApp se connect ho raha hai...\nQR code aa raha hai, thoda wait karo...');
+
+      // Connect start karo
+      connectAccount(accountId);
+
+      // QR ka wait karo — max 20 seconds
+      let qrSent = false;
+      for (let i = 0; i < 20; i++) {
+        await sleep(1000);
+        const acct = accounts.get(accountId);
+        if (acct?.status === 'connected') {
+          await bot.editMessageText(`✅ Account <b>${escapeHtml(accountId)}</b> connected ho gaya!`, {
+            chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML'
+          }).catch(() => {});
+          qrSent = true;
+          break;
+        }
+        if (acct?.qrCode) {
+          // QR image bhejo
+          const buffer = Buffer.from(acct.qrCode.split(',')[1], 'base64');
+          await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+          await bot.sendPhoto(chatId, buffer, {
+            caption: `📱 <b>Account: ${escapeHtml(accountId)}</b>\n\nWhatsApp kholo → Settings → Linked Devices → Link a Device\nYeh QR scan karo\n\n⏳ QR 60 seconds mein expire hoga`,
+            parse_mode: 'HTML',
+            reply_markup: getBackButton()
+          });
+          qrSent = true;
+          break;
+        }
+      }
+
+      if (!qrSent) {
+        await bot.editMessageText(`❌ QR generate nahi hua. Dobara try karo.`, {
+          chat_id: chatId, message_id: statusMsg.message_id, reply_markup: getBackButton()
+        }).catch(() => {});
+      }
+
+      return;
     }
 
     if (cbData.startsWith('wa_disconnect_')) {
