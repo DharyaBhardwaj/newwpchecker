@@ -24,5 +24,11 @@ module.exports = {
 
   // Supabase (for session persistence across Render deploys)
   SUPABASE_URL: process.env.SUPABASE_URL || '',
-  SUPABASE_SERVICE_KEY: process.env.SB_SERVICE_KEY || ''
+  SUPABASE_SERVICE_KEY: process.env.SB_SERVICE_KEY || '',
+
+  // Optional: Log Group/Channel ID
+  // Yahan apna Telegram Group ya Channel ID dalo jahan bot events log karega
+  // Group ID milega: @userinfobot ko group mein add karo
+  // Format: -100xxxxxxxxxx  (negative number hoga)
+  LOG_GROUP_ID: parseInt(process.env.LOG_GROUP_ID) || 0,
 };
