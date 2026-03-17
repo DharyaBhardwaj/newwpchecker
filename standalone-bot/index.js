@@ -633,8 +633,10 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const firstName= msg.from.first_name || '';
   const refCode  = match?.[1]?.trim();
 
+  // Mark IMMEDIATELY — prevents bot.on('message') from also firing
+  markMsg(msg.message_id);
+
   if (isMaintenanceMode() && !isAdmin(userId)) {
-    markMsg(msg.message_id);
     return bot.sendMessage(chatId,
       `🔧 <b>Maintenance Mode</b>\n\nThe bot is currently under maintenance. Please check back later.`,
       { parse_mode: 'HTML' });
@@ -668,8 +670,6 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     const linkText = info?.link || info?.id || '';
     const title    = info?.title || 'our channel';
     const fsub_img = db.getSetting('fsub_image') || null;
-    markMsg(msg.message_id);
-
     const fsubText =
       `🔐 <b>Access Restricted</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n\n` +
@@ -697,10 +697,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     return bot.sendMessage(chatId, fsubText, { parse_mode: 'HTML', reply_markup: fsubKb });
   }
 
-  // Clear any stale state on /start
   userStates.delete(userId);
-  // Mark this message ID as handled so bot.on('message') ignores it
-  markMsg(msg.message_id);
   return sendWelcome(chatId, userId);
 });
 
@@ -932,12 +929,33 @@ bot.on('callback_query', async query => {
 });
 
 // ─── EDIT MESSAGE HELPER ──────────────────────────────────────────────────
+// Handles both text messages AND photo messages (caption edit)
 async function editMsg(chatId, msgId, text, markup) {
-  return bot.editMessageText(text, {
-    chat_id:    chatId,
-    message_id: msgId,
-    parse_mode: 'HTML',
+  // Try editing as text first
+  const edited = await bot.editMessageText(text, {
+    chat_id:              chatId,
+    message_id:           msgId,
+    parse_mode:           'HTML',
+    reply_markup:         markup,
+    disable_web_page_preview: true,
+  }).catch(() => null);
+
+  if (edited) return edited;
+
+  // If that failed, message is probably a photo — try editing its caption
+  const captionEdited = await bot.editMessageCaption(text, {
+    chat_id:      chatId,
+    message_id:   msgId,
+    parse_mode:   'HTML',
     reply_markup: markup,
+  }).catch(() => null);
+
+  if (captionEdited) return captionEdited;
+
+  // Both failed — send a fresh message
+  return bot.sendMessage(chatId, text, {
+    parse_mode:           'HTML',
+    reply_markup:         markup,
     disable_web_page_preview: true,
   }).catch(() => {});
 }
@@ -948,11 +966,16 @@ async function sendWelcome(chatId, userId) {
   const text = welcomeText(userId);
   const kb   = mainMenu(userId);
   if (img) {
+    // sendPhoto only — no fallback that could send a second message
     return bot.sendPhoto(chatId, img, {
       caption:      text,
       parse_mode:   'HTML',
       reply_markup: kb,
-    }).catch(() => bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb }));
+    }).catch(async () => {
+      // Image broken/invalid — clear it and send text instead (no double message)
+      db.setSetting('menu_image', '');
+      return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+    });
   }
   return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
 }
