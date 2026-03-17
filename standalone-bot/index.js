@@ -535,12 +535,12 @@ function isMaintenanceMode() {
 function mainMenu(userId) {
   const admin = isAdmin(userId);
   const kb = [
-    [{ text: '🔍 Check Number', callback_data: 'check_number' }, { text: '📁 Bulk Check', callback_data: 'bulk_check' }],
-    [{ text: '🛠 Tools', callback_data: 'tools' }, { text: '👤 Profile', callback_data: 'profile' }],
-    [{ text: '💎 Premium', callback_data: 'premium_info' }, { text: '🔗 Referral', callback_data: 'referral' }],
-    [{ text: '📊 Status', callback_data: 'status' }, { text: '❓ Help', callback_data: 'help' }],
+    [{ text: '🔍 Check Number', callback_data: 'check_number' }, { text: '📋 Bulk Check', callback_data: 'bulk_check' }],
+    [{ text: '🧰 Tools', callback_data: 'tools' },              { text: '👤 My Profile', callback_data: 'profile' }],
+    [{ text: '💎 Premium Plans', callback_data: 'premium_info' },{ text: '🎁 Referral', callback_data: 'referral' }],
+    [{ text: '📡 Bot Status', callback_data: 'status' },         { text: '📖 Help', callback_data: 'help' }],
   ];
-  if (admin) kb.push([{ text: '⚙️ Owner Panel', callback_data: 'owner_panel' }]);
+  if (admin) kb.push([{ text: '⚙️ Admin Panel', callback_data: 'owner_panel' }]);
   return { inline_keyboard: kb };
 }
 
@@ -549,12 +549,28 @@ const backBtn = { inline_keyboard: [[{ text: '‹ Back to Menu', callback_data: 
 // ─── WELCOME MESSAGE ──────────────────────────────────────────────────────
 function welcomeText(userId) {
   const checkers = getConnectedCheckers();
-  const status   = checkers.length
-    ? `🟢 <b>${checkers.length}</b> account(s) online`
-    : '🔴 No accounts connected';
+  const statusLine = checkers.length
+    ? `<b>🟢 Online</b> — <i>${checkers.length} checker account(s) active</i>`
+    : `<b>🔴 Offline</b> — <i>No accounts connected</i>`;
   const u = db.getUser(userId);
-  const greeting = u?.is_premium ? '💎 Welcome back, Premium Member!' : '👋 Welcome!';
-  return `${greeting}\n\n<b>WhatsApp Number Checker</b>\n${status}\n\n<i>Verify if phone numbers are registered on WhatsApp — fast, accurate, and secure.</i>`;
+  const name = u?.first_name ? ` ${esc(u.first_name)}` : '';
+  const badge = u && db.isPremiumActive(u.telegram_id) ? '💎' : '👤';
+  const tier  = u && db.isPremiumActive(u.telegram_id) ? '<b>Premium Member</b>' : '<b>Free User</b>';
+  return (
+    `╔══════════════════════╗\n` +
+    `  🔍  <b>WA Number Checker</b>\n` +
+    `╚══════════════════════╝\n\n` +
+    `${badge} Hello${name}! — ${tier}\n` +
+    `${statusLine}\n\n` +
+    `<i>Instantly verify whether any phone number\nis registered on WhatsApp.</i>\n\n` +
+    `<b>┌ Features</b>\n` +
+    `<b>│</b> ✅ Single & Bulk number check\n` +
+    `<b>│</b> ⚡ Fast load-balanced checking\n` +
+    `<b>│</b> 📁 File upload support\n` +
+    `<b>│</b> 🎁 Referral rewards\n` +
+    `<b>└</b> 💎 Premium plans available\n\n` +
+    `<i>Choose an option below to get started:</i>`
+  );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -602,11 +618,35 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   if (!isMember) {
     const info = await getFsubChannelInfo();
     const linkText = info?.link || info?.id || '';
-    const title = info?.title || 'our channel';
+    const title    = info?.title || 'our channel';
+    const fsub_img = db.getSetting('fsub_image') || null;
     markMsg(msg.message_id);
-    return bot.sendMessage(chatId,
-      `🔒 <b>Access Required</b>\n\nTo use this bot, you must join:\n\n👉 <b><a href="${esc(linkText)}">${esc(title)}</a></b>\n\nAfter joining, click /start again.`,
-      { parse_mode: 'HTML', disable_web_page_preview: false });
+
+    const fsubText =
+      `🔐 <b>Access Restricted</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `To use <b>WA Number Checker</b>, you must\n` +
+      `first join our official channel.\n\n` +
+      `📢 <b>Channel:</b> <a href="${esc(linkText)}">${esc(title)}</a>\n\n` +
+      `<i>① Tap the button below to join\n` +
+      `② Come back and click /start</i>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━`;
+
+    const fsubKb = { inline_keyboard: [
+      [{ text: `📢 Join — ${esc(title)}`, url: linkText }],
+      [{ text: '✅ I have joined — Check Again', callback_data: 'fsub_verify' }],
+    ]};
+
+    if (fsub_img) {
+      return bot.sendPhoto(chatId, fsub_img, {
+        caption:      fsubText,
+        parse_mode:   'HTML',
+        reply_markup: fsubKb,
+      }).catch(() =>
+        bot.sendMessage(chatId, fsubText, { parse_mode: 'HTML', reply_markup: fsubKb })
+      );
+    }
+    return bot.sendMessage(chatId, fsubText, { parse_mode: 'HTML', reply_markup: fsubKb });
   }
 
   // Clear any stale state on /start
@@ -723,6 +763,7 @@ bot.on('callback_query', async query => {
     case 'op_settings':  return showBotSettings(chatId, userId, msgId);
     case 'op_stats':     return showDetailedStats(chatId, userId, msgId);
     case 'op_logs':      return setupLogGroup(chatId, userId, msgId);
+    case 'fsub_verify':  return handleFsubVerify(query);
 
     // Settings toggles
     case 'set_public':
@@ -747,6 +788,21 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       db.setSetting('fsub_channel', '');
       return showFsubSettings(chatId, userId, msgId);
+
+    case 'fsub_img_remove':
+      if (!isAdmin(userId)) return;
+      db.setSetting('fsub_image', '');
+      return showFsubSettings(chatId, userId, msgId);
+
+    case 'set_fsub_image':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_fsub_image' });
+      return editMsg(chatId, msgId,
+        `🖼 <b>Set FSub Thumbnail</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Send a <b>photo</b> or paste a <b>direct image URL</b>.\n\n` +
+        `<i>This image will appear with the "Join Channel" prompt.</i>`,
+        backBtn);
 
     case 'set_fsub_input':
       if (!isAdmin(userId)) return;
@@ -819,19 +875,36 @@ async function showMainMenu(chatId, userId, msgId) {
 async function showCheckNumber(chatId, userId, msgId) {
   userStates.set(userId, { mode: 'check_single' });
   return editMsg(chatId, msgId,
-    `🔍 <b>Check Single Number</b>\n\nSend a phone number to verify:\n\n• With country code: <code>919876543210</code>\n• Or with +: <code>+919876543210</code>`,
+    `🔍 <b>Check Single Number</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Send a phone number to verify if it's\nregistered on WhatsApp.\n\n` +
+    `<b>📌 Format Examples:</b>\n` +
+    `  • <code>919876543210</code>  <i>(India)</i>\n` +
+    `  • <code>14155552671</code>   <i>(USA)</i>\n` +
+    `  • <code>+44 7911 123456</code>\n\n` +
+    `<i>💡 Always include country code, no spaces needed.</i>`,
     backBtn);
 }
 
 // ─── BULK CHECK ───────────────────────────────────────────────────────────
 async function showBulkCheck(chatId, userId, msgId) {
-  const freeLimit  = parseInt(db.getSetting('free_limit')  || '20');
-  const premLimit  = parseInt(db.getSetting('prem_limit')  || '500');
-  const bulkLimit  = parseInt(db.getSetting('bulk_limit')  || '100');
-  const isPrem = isPremium(userId);
+  const freeLimit = parseInt(db.getSetting('free_limit') || '20');
+  const premLimit = parseInt(db.getSetting('prem_limit') || '500');
+  const bulkLimit = parseInt(db.getSetting('bulk_limit') || '100');
+  const isPrem    = isPremium(userId);
+  const myLimit   = isPrem ? premLimit : freeLimit;
+  const limits    = db.getRemainingChecks(userId, freeLimit, premLimit);
   userStates.set(userId, { mode: 'bulk_check' });
   return editMsg(chatId, msgId,
-    `📁 <b>Bulk Check</b>\n\nSend multiple numbers (one per line) or upload a <code>.txt</code> file.\n\n📊 <b>Your limits:</b>\n• Daily: <code>${isPrem ? premLimit : freeLimit}</code> checks\n• Per request: <code>${bulkLimit}</code> numbers\n\n${isPrem ? '💎 Premium user' : ''}`,
+    `📋 <b>Bulk Number Check</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Send numbers <b>one per line</b> or upload a <b>.txt file</b>.\n\n` +
+    `<b>📊 Your Quota:</b>\n` +
+    `  • Daily limit: <code>${myLimit}</code> checks\n` +
+    `  • Remaining today: <code>${limits.remaining}</code>\n` +
+    `  • Per request max: <code>${bulkLimit}</code>\n` +
+    `  • Tier: ${isPrem ? '<b>💎 Premium</b>' : '<b>👤 Free</b>'}\n\n` +
+    `<i>Results for large batches (50+) are sent\nas downloadable .txt files.</i>`,
     backBtn);
 }
 
@@ -839,10 +912,15 @@ async function showBulkCheck(chatId, userId, msgId) {
 async function showTools(chatId, userId, msgId) {
   const count = db.getNumberCount(userId);
   return editMsg(chatId, msgId,
-    `🛠 <b>Tools</b>\n\nManage your personal number pool.\n\n📦 Numbers in pool: <code>${count}</code>`,
+    `🧰 <b>Number Pool — Tools</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Upload a list of numbers and dispense them\none-by-one whenever you need.\n\n` +
+    `<b>📦 Pool Status:</b>\n` +
+    `  • Available numbers: <code>${count}</code>\n\n` +
+    `<i>Great for managing number inventories\nwithout exposing them all at once.</i>`,
     { inline_keyboard: [
       [{ text: '📤 Upload Numbers', callback_data: 'tools_upload' }],
-      [{ text: '🎲 Get Next Number', callback_data: 'tools_get' }, { text: '🔄 Skip Number', callback_data: 'tools_change' }],
+      [{ text: '🎲 Get Next Number', callback_data: 'tools_get' }, { text: '⏭ Skip / Next', callback_data: 'tools_change' }],
       [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
     ]});
 }
@@ -873,18 +951,19 @@ async function showProfile(chatId, userId, msgId) {
     [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
   ]};
   return editMsg(chatId, msgId,
-    `👤 <b>Your Profile</b>\n\n` +
-    `🆔 ID: <code>${userId}</code>\n` +
-    `👤 Username: @${esc(u.username) || 'N/A'}\n` +
-    `🎭 Role: ${role}${premText}\n\n` +
-    `📊 <b>Statistics</b>\n` +
-    `• Total checks: <b>${fmt(u.numbers_checked)}</b>\n` +
-    `• Today's checks: <b>${dailyUsed} / ${limit}</b>\n` +
-    `• Bonus checks: <b>${u.bonus_checks || 0}</b>\n\n` +
-    `🔗 <b>Referral</b>\n` +
-    `• Code: <code>${u.refer_code || 'N/A'}</code>\n` +
-    `• Referrals made: <b>${u.refer_count || 0}</b>\n\n` +
-    `📅 Joined: ${joined}`,
+    `👤 <b>My Profile</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `🆔 <b>ID:</b> <code>${userId}</code>\n` +
+    `📛 <b>Username:</b> @${esc(u.username) || 'N/A'}\n` +
+    `🎭 <b>Role:</b> ${role}${premText}\n\n` +
+    `<b>📊 Statistics</b>\n` +
+    `  ├ Total checks:  <b>${fmt(u.numbers_checked)}</b>\n` +
+    `  ├ Today:         <b>${dailyUsed} / ${limit}</b>\n` +
+    `  └ Bonus checks:  <b>${u.bonus_checks || 0}</b>\n\n` +
+    `<b>🎁 Referral Program</b>\n` +
+    `  ├ Your code:  <code>${u.refer_code || 'N/A'}</code>\n` +
+    `  └ Referrals:  <b>${u.refer_count || 0}</b> friends joined\n\n` +
+    `📅 <b>Joined:</b> <i>${joined}</i>`,
     kb);
 }
 
@@ -905,18 +984,31 @@ async function showPremiumInfo(chatId, userId, msgId) {
       expText = `⏳ <b>${diff} day(s) remaining</b>\n📅 Expires: ${d.toLocaleDateString()}`;
     }
     return editMsg(chatId, msgId,
-      `💎 <b>Your Premium Status</b>\n\n${expText}\n\n` +
-      `✅ Daily limit: <b>${premLimit} checks/day</b>\n` +
-      `✅ Bulk up to: <b>${bulkLimit} at once</b>\n` +
-      `✅ Priority support\n✅ No ads`,
+      `💎 <b>Premium Status</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `${expText}\n\n` +
+      `<b>✨ Your Benefits:</b>\n` +
+      `  ✅ <b>${premLimit}</b> checks per day\n` +
+      `  ✅ Bulk up to <b>${bulkLimit}</b> numbers\n` +
+      `  ✅ Priority processing\n` +
+      `  ✅ Premium support\n\n` +
+      `<i>Thank you for being a Premium member! 🙏</i>`,
       backBtn);
   }
 
   return editMsg(chatId, msgId,
-    `💎 <b>Upgrade to Premium</b>\n\n` +
-    `<b>Free Plan:</b>\n• ${freeLimit} checks per day\n\n` +
-    `<b>Premium Plan:</b>\n✅ ${premLimit} checks per day\n✅ Bulk check up to ${bulkLimit}\n✅ Priority support\n✅ Faster results\n\n` +
-    `To purchase, contact the owner:`,
+    `💎 <b>Upgrade to Premium</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `<b>Compare Plans:</b>\n\n` +
+    `<b>👤 Free</b>\n` +
+    `  • ${freeLimit} checks / day\n` +
+    `  • Basic features only\n\n` +
+    `<b>💎 Premium</b>\n` +
+    `  ✅ <b>${premLimit}</b> checks per day\n` +
+    `  ✅ Bulk up to <b>${bulkLimit}</b> numbers\n` +
+    `  ✅ Priority processing\n` +
+    `  ✅ Dedicated support\n\n` +
+    `<i>To purchase, contact the owner below:</i>`,
     { inline_keyboard: [
       [{ text: '👤 ⏤͟͞Dhairya Bhardwaj', url: 'https://t.me/bhardwa_j' }],
       [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
@@ -931,11 +1023,15 @@ async function showReferral(chatId, userId, msgId) {
   const botInfo = await bot.getMe();
   const link    = `https://t.me/${botInfo.username}?start=${u.refer_code}`;
   return editMsg(chatId, msgId,
-    `🔗 <b>Referral Program</b>\n\n` +
-    `Invite friends and earn <b>+${bonus} checks</b> for every referral!\n\n` +
-    `📎 <b>Your Link:</b>\n<code>${link}</code>\n\n` +
-    `📊 Total referrals: <b>${u.refer_count || 0}</b>\n` +
-    `🎁 Bonus checks earned: <b>${u.bonus_checks || 0}</b>`,
+    `🎁 <b>Referral Program</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Invite friends & earn <b>+${bonus} free checks</b>\nfor every person who joins!\n\n` +
+    `<b>🔗 Your Referral Link:</b>\n` +
+    `<code>${link}</code>\n\n` +
+    `<b>📈 Your Stats:</b>\n` +
+    `  ├ Friends referred: <b>${u.refer_count || 0}</b>\n` +
+    `  └ Bonus earned:     <b>${u.bonus_checks || 0} checks</b>\n\n` +
+    `<i>Share your link and watch your credits grow! 🚀</i>`,
     { inline_keyboard: [
       [{ text: '📤 Share Link', switch_inline_query: `Join using my link: ${link}` }],
       [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
@@ -961,20 +1057,33 @@ async function showStatus(chatId, userId, msgId) {
   }
   const active = getConnectedCheckers().length;
   return editMsg(chatId, msgId,
-    `📊 <b>System Status</b>\n\n${body}✅ Checker accounts online: <b>${active}</b>`,
+    `📡 <b>System Status</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `${body}` +
+    `<b>━━━━━━━━━━━━━━━━━━━━</b>\n` +
+    `✅ <b>Active checkers:</b> <code>${active}</code>`,
     backBtn);
 }
 
 // ─── HELP ─────────────────────────────────────────────────────────────────
 async function showHelp(chatId, userId, msgId) {
   return editMsg(chatId, msgId,
-    `❓ <b>How to Use</b>\n\n` +
-    `<b>🔍 Check Number</b>\nTap the button, then send any phone number with country code.\n\n` +
-    `<b>📁 Bulk Check</b>\nTap the button, then send multiple numbers (one per line) or upload a <code>.txt</code> file.\n\n` +
-    `<b>🛠 Tools</b>\nUpload a pool of numbers and retrieve them one by one.\n\n` +
-    `<b>💎 Premium</b>\nGet higher daily limits and faster processing.\n\n` +
-    `<b>🔗 Referral</b>\nShare your link — earn bonus checks for every friend who joins.\n\n` +
-    `📞 <b>Support:</b>`,
+    `📖 <b>Help & Guide</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `<b>🔍 Check Number</b>\n` +
+    `  Tap → send any number with country code\n` +
+    `  <i>e.g. 919876543210</i>\n\n` +
+    `<b>📋 Bulk Check</b>\n` +
+    `  Tap → send numbers (one per line) or a .txt file\n` +
+    `  <i>Results sent as file for 50+ numbers</i>\n\n` +
+    `<b>🧰 Tools</b>\n` +
+    `  Upload a number pool, dispense one-by-one\n\n` +
+    `<b>💎 Premium</b>\n` +
+    `  Higher daily limits + priority processing\n\n` +
+    `<b>🎁 Referral</b>\n` +
+    `  Share link → earn free bonus checks\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📞 <b>Need help? Contact support:</b>`,
     { inline_keyboard: [
       [{ text: '💬 Contact Support', url: 'https://t.me/bhardwa_j' }],
       [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
@@ -1249,29 +1358,33 @@ async function startBroadcast(chatId, userId, msgId) {
 // ✅ FIX: Shows channel name and invite link automatically
 async function showFsubSettings(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
-  const ch = db.getSetting('fsub_channel');
-  let body = `🔒 <b>Force Subscribe</b>\n\n`;
+  const ch      = db.getSetting('fsub_channel');
+  const fsubImg = db.getSetting('fsub_image') || null;
+  let body = `🔒 <b>Force Subscribe Settings</b>\n` +
+             `━━━━━━━━━━━━━━━━━━━━\n\n`;
 
   if (ch) {
     const info = await getFsubChannelInfo();
-    if (info) {
-      body += `📢 Channel: <b>${esc(info.title)}</b>\n`;
-      if (info.username) body += `🔗 Username: ${esc(info.username)}\n`;
-      if (info.link) body += `📎 Link: ${esc(info.link)}\n`;
-      body += `🆔 ID: <code>${esc(ch)}</code>\n\n`;
-    } else {
-      body += `Current: <code>${esc(ch)}</code>\n\n`;
-    }
-    body += `Users must join this channel before using the bot.`;
+    body += `<b>📢 Channel:</b> ${info ? `<b>${esc(info.title)}</b>` : `<code>${esc(ch)}</code>`}\n`;
+    if (info?.username) body += `<b>🔗 Handle:</b> ${esc(info.username)}\n`;
+    if (info?.link)     body += `<b>📎 Link:</b> ${esc(info.link)}\n`;
+    body += `<b>🆔 ID:</b> <code>${esc(ch)}</code>\n`;
   } else {
-    body += `No channel set.\n\nUsers can use the bot freely without joining any channel.`;
+    body += `<i>No channel set — bot is open to all users.</i>\n`;
   }
 
-  return editMsg(chatId, msgId, body,
-    { inline_keyboard: [
-      [{ text: '✏️ Set Channel', callback_data: 'set_fsub_input' }, { text: '❌ Remove', callback_data: 'fsub_remove' }],
-      [{ text: '‹ Back', callback_data: 'owner_panel' }],
-    ]});
+  body += `\n<b>🖼 Thumbnail:</b> ${fsubImg ? '✅ Set' : '❌ Not set'}\n`;
+  body += `<i>(Image shown with the join prompt)</i>`;
+
+  const kb = { inline_keyboard: [
+    [{ text: ch ? '✏️ Change Channel' : '➕ Set Channel', callback_data: 'set_fsub_input' },
+     { text: '🖼 Set Image', callback_data: 'set_fsub_image' }],
+    ch ? [{ text: '🗑 Remove Channel', callback_data: 'fsub_remove' }] : [],
+    fsubImg ? [{ text: '🗑 Remove Image', callback_data: 'fsub_img_remove' }] : [],
+    [{ text: '‹ Back', callback_data: 'owner_panel' }],
+  ].filter(r => r.length)};
+
+  return editMsg(chatId, msgId, body, kb);
 }
 
 // ─── BOT SETTINGS ─────────────────────────────────────────────────────────
@@ -1335,6 +1448,20 @@ async function setupLogGroup(chatId, userId, msgId) {
   return editMsg(chatId, msgId,
     `📋 <b>Log Group Setup</b>\n\nCurrent: <code>${esc(current)}</code>\n\nAll bot events (joins, checks, errors) will be sent here.\nSend the group/channel ID:`,
     backBtn);
+}
+
+// ─── FSUB VERIFY BUTTON ──────────────────────────────────────────────────
+async function handleFsubVerify(query) {
+  const userId = query.from.id;
+  const chatId = query.message.chat.id;
+  const isMember = await checkForceSub(userId);
+  if (isMember) {
+    userStates.delete(userId);
+    await bot.answerCallbackQuery(query.id, { text: '✅ Access granted!', show_alert: false }).catch(() => {});
+    return bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
+  } else {
+    return bot.answerCallbackQuery(query.id, { text: '❌ You have not joined yet. Please join first!', show_alert: true }).catch(() => {});
+  }
 }
 
 // ─── GET / CHANGE NUMBER ─────────────────────────────────────────────────
@@ -1528,6 +1655,14 @@ bot.on('message', async msg => {
     return bot.sendMessage(chatId, `✅ Premium granted to <code>${targetId}</code> — ${expTxt}`, { parse_mode: 'HTML' });
   }
 
+  if (state?.mode === 'set_fsub_image') {
+    userStates.delete(userId);
+    db.setSetting('fsub_image', text.trim());
+    return bot.sendMessage(chatId,
+      `✅ <b>FSub image URL saved!</b>\nIt will now appear with the join prompt.`,
+      { parse_mode: 'HTML' });
+  }
+
   if (state?.mode === 'set_fsub') {
     userStates.delete(userId);
     const ch = text.trim();
@@ -1644,6 +1779,23 @@ bot.on('message', async msg => {
 });
 
 // ─── DOCUMENT HANDLER ─────────────────────────────────────────────────────
+// ─── PHOTO HANDLER (for fsub image upload) ───────────────────────────────
+bot.on('photo', async msg => {
+  const userId = msg.from?.id;
+  const chatId = msg.chat.id;
+  if (!userId || !isAdmin(userId)) return;
+  const state = userStates.get(userId);
+  if (state?.mode !== 'set_fsub_image') return;
+  userStates.delete(userId);
+  // Get the highest resolution photo
+  const photo  = msg.photo[msg.photo.length - 1];
+  const fileId = photo.file_id;
+  db.setSetting('fsub_image', fileId);
+  return bot.sendMessage(chatId,
+    `✅ <b>FSub image saved!</b>\nThis photo will appear with the join prompt.`,
+    { parse_mode: 'HTML' });
+});
+
 bot.on('document', async msg => {
   const chatId   = msg.chat.id;
   const userId   = msg.from.id;
