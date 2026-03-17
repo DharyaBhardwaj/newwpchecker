@@ -653,7 +653,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   userStates.delete(userId);
   // Mark this message ID as handled so bot.on('message') ignores it
   markMsg(msg.message_id);
-  return bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
+  return sendWelcome(chatId, userId);
 });
 
 // ─── FORCE SUBSCRIBE CHECK ─────────────────────────────────────────────────
@@ -738,6 +738,8 @@ bot.on('callback_query', async query => {
   if (data.startsWith('user_promote_'))  return handleUserRole(chatId, userId, msgId, parseInt(data.replace('user_promote_','')), 'admin');
   if (data.startsWith('user_demote_'))   return handleUserRole(chatId, userId, msgId, parseInt(data.replace('user_demote_','')), 'user');
   if (data.startsWith('user_remprem_'))  return handleRemovePremium(chatId, userId, msgId, parseInt(data.replace('user_remprem_','')));
+  if (data.startsWith('user_prem30_'))   return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_prem30_','')), 30);
+  if (data.startsWith('user_premlife_')) return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_premlife_','')), 'lifetime');
 
   switch (data) {
     case 'main_menu':    return showMainMenu(chatId, userId, msgId);
@@ -831,6 +833,21 @@ bot.on('callback_query', async query => {
       userStates.set(userId, { mode: 'set_refer_bonus' });
       return editMsg(chatId, msgId, `⚙️ <b>Set Referral Bonus Checks</b>\n\nCurrent: <code>${db.getSetting('refer_bonus') || 10}</code>\n\nSend new value:`, backBtn);
 
+    case 'set_menu_image':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_menu_image' });
+      return editMsg(chatId, msgId,
+        `🖼 <b>Set Main Menu Image</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Send a <b>photo</b> or a <b>direct image URL</b>.\n\n` +
+        `<i>This image appears with the main menu\nwhen users start the bot.</i>`,
+        backBtn);
+
+    case 'menu_img_remove':
+      if (!isAdmin(userId)) return;
+      db.setSetting('menu_image', '');
+      return bot.sendMessage(chatId, `✅ Menu image removed.`, { parse_mode: 'HTML' }).then(() => showBotSettings(chatId, userId, msgId));
+
     case 'set_log_group':
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'set_log_group' });
@@ -866,8 +883,29 @@ async function editMsg(chatId, msgId, text, markup) {
   }).catch(() => {});
 }
 
+// ─── SEND WELCOME (with optional banner image) ───────────────────────────
+async function sendWelcome(chatId, userId) {
+  const img  = db.getSetting('menu_image') || null;
+  const text = welcomeText(userId);
+  const kb   = mainMenu(userId);
+  if (img) {
+    return bot.sendPhoto(chatId, img, {
+      caption:      text,
+      parse_mode:   'HTML',
+      reply_markup: kb,
+    }).catch(() => bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb }));
+  }
+  return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+}
+
 async function showMainMenu(chatId, userId, msgId) {
   userStates.delete(userId);
+  // Try to edit existing message first; if it fails (e.g. was a photo), send fresh
+  const img = db.getSetting('menu_image') || null;
+  if (img) {
+    // Can't edit a text message into a photo — send new
+    return sendWelcome(chatId, userId);
+  }
   return editMsg(chatId, msgId, welcomeText(userId), mainMenu(userId));
 }
 
@@ -1294,54 +1332,111 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
 
   const role    = u.role === 'owner' ? '👑 Owner' : u.role === 'admin' ? '⭐ Admin' : '👤 User';
   const prem    = db.isPremiumActive(targetId);
-  const premTxt = prem ? (u.premium_until ? `until ${new Date(u.premium_until).toLocaleDateString()}` : 'Lifetime') : 'No';
-  const banned  = u.is_blocked ? '🚫 Yes' : '✅ No';
+  const premTxt = prem
+    ? (u.premium_until ? `✅ Active until ${new Date(u.premium_until).toLocaleDateString()}` : '✅ Lifetime')
+    : '❌ None';
+
+  // Row 1: Ban/Unban
+  const banRow = u.is_blocked
+    ? [{ text: '✅ Unban User', callback_data: `user_unban_${targetId}` }]
+    : [{ text: '🚫 Ban User',   callback_data: `user_ban_${targetId}` }];
+
+  // Row 2: Premium — add 30d / add lifetime / remove
+  const premRow = prem
+    ? [{ text: '❌ Remove Premium', callback_data: `user_remprem_${targetId}` }]
+    : [
+        { text: '💎 +30 Days',   callback_data: `user_prem30_${targetId}` },
+        { text: '♾ Lifetime',    callback_data: `user_premlife_${targetId}` },
+      ];
+
+  // Row 3: Role
+  const roleRow = u.role === 'admin'
+    ? [{ text: '⬇️ Demote to User',     callback_data: `user_demote_${targetId}` }]
+    : [{ text: '⬆️ Promote to Admin',   callback_data: `user_promote_${targetId}` }];
 
   const kb = { inline_keyboard: [
-    u.is_blocked
-      ? [{ text: '✅ Unban', callback_data: `user_unban_${targetId}` }]
-      : [{ text: '🚫 Ban', callback_data: `user_ban_${targetId}` }],
-    u.role === 'admin'
-      ? [{ text: '⬇️ Demote', callback_data: `user_demote_${targetId}` }]
-      : [{ text: '⬆️ Promote to Admin', callback_data: `user_promote_${targetId}` }],
-    prem
-      ? [{ text: '❌ Remove Premium', callback_data: `user_remprem_${targetId}` }]
-      : [],
+    banRow,
+    premRow,
+    roleRow,
     [{ text: '‹ Back to Users', callback_data: 'op_users' }],
-  ].filter(r => r.length)};
+  ]};
+
+  const today = new Date().toISOString().split('T')[0];
+  const dailyUsed = u.daily_reset === today ? (u.daily_checks || 0) : 0;
 
   const text =
-    `👤 <b>User Info</b>\n\n` +
-    `🆔 ID: <code>${targetId}</code>\n` +
-    `👤 @${esc(u.username)||'N/A'} — ${esc(u.first_name||'')}\n` +
-    `🎭 Role: ${role}\n` +
-    `💎 Premium: ${premTxt}\n` +
-    `🚫 Banned: ${banned}\n` +
-    `📊 Checks: ${fmt(u.numbers_checked)}\n` +
-    `📅 Joined: ${new Date(u.joined_at).toLocaleDateString()}`;
+    `👤 <b>User Details</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `🆔 <b>ID:</b> <code>${targetId}</code>\n` +
+    `📛 <b>Username:</b> @${esc(u.username) || 'N/A'}\n` +
+    `👤 <b>Name:</b> ${esc(u.first_name || 'N/A')}\n` +
+    `🎭 <b>Role:</b> ${role}\n\n` +
+    `<b>💎 Premium:</b> ${premTxt}\n` +
+    `<b>🚫 Banned:</b> ${u.is_blocked ? 'Yes' : 'No'}\n\n` +
+    `<b>📊 Stats:</b>\n` +
+    `  ├ Total checks: <b>${fmt(u.numbers_checked)}</b>\n` +
+    `  ├ Today:        <b>${dailyUsed}</b>\n` +
+    `  └ Bonus:        <b>${u.bonus_checks || 0}</b>\n\n` +
+    `📅 <b>Joined:</b> <i>${new Date(u.joined_at).toLocaleDateString()}</i>`;
 
-  // Always sendMessage — msgId may be from a different message after showUsersList
   return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
 }
 
 async function handleUserBan(chatId, adminId, msgId, targetId, ban) {
   if (!isAdmin(adminId)) return;
   db.blockUser(targetId, ban);
-  sendLog(`${ban ? '🚫' : '✅'} <b>User ${ban ? 'Banned' : 'Unbanned'}</b>\n🆔 <code>${targetId}</code>`);
+  // Notify the user
+  bot.sendMessage(targetId,
+    ban
+      ? `🚫 <b>You have been banned</b> from using this bot.\n\n<i>Contact support if you think this is a mistake.</i>`
+      : `✅ <b>Your ban has been lifted.</b>\n\nYou can now use the bot again. Type /start`,
+    { parse_mode: 'HTML' }
+  ).catch(() => {});
+  sendLog(`${ban ? '🚫' : '✅'} <b>User ${ban ? 'Banned' : 'Unbanned'}</b>\n🆔 <code>${targetId}</code>\nBy: <code>${adminId}</code>`);
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
 async function handleUserRole(chatId, adminId, msgId, targetId, role) {
   if (!isOwner(adminId) && role === 'admin') return;
   db.updateRole(targetId, role);
-  sendLog(`🎭 <b>User ${role === 'admin' ? 'Promoted to Admin' : 'Demoted'}</b>\n🆔 <code>${targetId}</code>`);
+  bot.sendMessage(targetId,
+    role === 'admin'
+      ? `⭐ <b>You have been promoted to Admin!</b>\n\nYou now have access to the Admin Panel.`
+      : `👤 <b>Your admin role has been removed.</b>`,
+    { parse_mode: 'HTML' }
+  ).catch(() => {});
+  sendLog(`🎭 <b>User ${role === 'admin' ? 'Promoted to Admin' : 'Demoted'}</b>\n🆔 <code>${targetId}</code>\nBy: <code>${adminId}</code>`);
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
 async function handleRemovePremium(chatId, adminId, msgId, targetId) {
   if (!isAdmin(adminId)) return;
   db.removePremium(targetId);
-  sendLog(`💎 <b>Premium Removed</b>\n🆔 <code>${targetId}</code>`);
+  bot.sendMessage(targetId,
+    `💔 <b>Your Premium has been removed.</b>\n\nYou are now on the Free plan.`,
+    { parse_mode: 'HTML' }
+  ).catch(() => {});
+  sendLog(`💎 <b>Premium Removed</b>\n🆔 <code>${targetId}</code>\nBy: <code>${adminId}</code>`);
+  return handleUserInfo(chatId, adminId, msgId, targetId);
+}
+
+async function handleAddPremium(chatId, adminId, msgId, targetId, days) {
+  if (!isAdmin(adminId)) return;
+  let until = null;
+  if (days !== 'lifetime') {
+    until = new Date();
+    until.setDate(until.getDate() + days);
+  }
+  db.createUser(targetId, '', '', 'user');
+  db.setPremium(targetId, until);
+  const expTxt = until ? `until ${until.toLocaleDateString()}` : 'Lifetime';
+  bot.sendMessage(targetId,
+    `💎 <b>Premium Activated!</b>\n\n` +
+    `${until ? `Active until <b>${until.toLocaleDateString()}</b>` : '✨ You have <b>Lifetime Premium</b>!'}\n\n` +
+    `Enjoy your benefits! 🎉`,
+    { parse_mode: 'HTML' }
+  ).catch(() => {});
+  sendLog(`💎 <b>Premium Added</b>\n🆔 <code>${targetId}</code>\n⏳ ${expTxt}\nBy: <code>${adminId}</code>`);
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
@@ -1390,31 +1485,41 @@ async function showFsubSettings(chatId, userId, msgId) {
 // ─── BOT SETTINGS ─────────────────────────────────────────────────────────
 async function showBotSettings(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
-  const mode   = db.getSetting('bot_mode')   || 'public';
-  const maint  = db.getSetting('maintenance')|| 'off';
-  const paid   = db.getSetting('paid_mode')  || 'false';
-  const freeL  = db.getSetting('free_limit') || '20';
-  const premL  = db.getSetting('prem_limit') || '500';
-  const bulkL  = db.getSetting('bulk_limit') || '100';
-  const refB   = db.getSetting('refer_bonus')|| '10';
+  const mode    = db.getSetting('bot_mode')   || 'public';
+  const maint   = db.getSetting('maintenance')|| 'off';
+  const paid    = db.getSetting('paid_mode')  || 'false';
+  const freeL   = db.getSetting('free_limit') || '20';
+  const premL   = db.getSetting('prem_limit') || '500';
+  const bulkL   = db.getSetting('bulk_limit') || '100';
+  const refB    = db.getSetting('refer_bonus')|| '10';
+  const menuImg = db.getSetting('menu_image') || null;
 
   return editMsg(chatId, msgId,
-    `⚙️ <b>Bot Settings</b>\n\n` +
-    `🌐 Mode: <b>${mode}</b>\n` +
-    `🔧 Maintenance: <b>${maint}</b>\n` +
-    `💰 Paid Mode: <b>${paid}</b>\n` +
-    `👤 Free daily limit: <b>${freeL}</b>\n` +
-    `💎 Premium daily limit: <b>${premL}</b>\n` +
-    `📁 Bulk limit: <b>${bulkL}</b>\n` +
-    `🔗 Refer bonus: <b>${refB} checks</b>`,
+    `⚙️ <b>Bot Settings</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `🌐 <b>Mode:</b> <code>${mode}</code>\n` +
+    `🔧 <b>Maintenance:</b> <code>${maint}</code>\n` +
+    `💰 <b>Paid Mode:</b> <code>${paid}</code>\n` +
+    `👤 <b>Free limit:</b> <code>${freeL}/day</code>\n` +
+    `💎 <b>Premium limit:</b> <code>${premL}/day</code>\n` +
+    `📁 <b>Bulk limit:</b> <code>${bulkL}</code>\n` +
+    `🔗 <b>Refer bonus:</b> <code>${refB} checks</code>\n` +
+    `🖼 <b>Menu image:</b> ${menuImg ? '✅ Set' : '❌ Not set'}`,
     { inline_keyboard: [
-      [{ text: mode==='public'?'✅ Public':'⬜ Public', callback_data:'set_public' }, { text: mode==='private'?'✅ Private':'⬜ Private', callback_data:'set_private' }],
-      [{ text: maint==='on'?'✅ Maintenance ON':'⬜ Maintenance ON', callback_data:'maint_on' }, { text: maint==='off'?'✅ Maintenance OFF':'⬜ Maintenance OFF', callback_data:'maint_off' }],
-      [{ text: paid==='true'?'✅ Paid Mode ON':'⬜ Paid Mode ON', callback_data:'paid_on' }, { text: paid!=='true'?'✅ Paid Mode OFF':'⬜ Paid Mode OFF', callback_data:'paid_off' }],
-      [{ text: '👤 Free Limit', callback_data:'set_free_limit' }, { text: '💎 Premium Limit', callback_data:'set_prem_limit' }],
-      [{ text: '📁 Bulk Limit', callback_data:'set_bulk_limit' }, { text: '🔗 Refer Bonus', callback_data:'set_refer_bonus' }],
-      [{ text: '‹ Back', callback_data:'owner_panel' }],
-    ]});
+      [{ text: mode==='public'?'✅ Public':'⬜ Public', callback_data:'set_public' },
+       { text: mode==='private'?'✅ Private':'⬜ Private', callback_data:'set_private' }],
+      [{ text: maint==='on'?'✅ Maint ON':'⬜ Maint ON', callback_data:'maint_on' },
+       { text: maint==='off'?'✅ Maint OFF':'⬜ Maint OFF', callback_data:'maint_off' }],
+      [{ text: paid==='true'?'✅ Paid ON':'⬜ Paid ON', callback_data:'paid_on' },
+       { text: paid!=='true'?'✅ Paid OFF':'⬜ Paid OFF', callback_data:'paid_off' }],
+      [{ text: '👤 Free Limit', callback_data:'set_free_limit' },
+       { text: '💎 Premium Limit', callback_data:'set_prem_limit' }],
+      [{ text: '📁 Bulk Limit', callback_data:'set_bulk_limit' },
+       { text: '🔗 Refer Bonus', callback_data:'set_refer_bonus' }],
+      [{ text: menuImg ? '🖼 Change Menu Image' : '🖼 Set Menu Image', callback_data: 'set_menu_image' },
+       menuImg ? { text: '🗑 Remove Menu Image', callback_data: 'menu_img_remove' } : { text: '‹ Back', callback_data: 'owner_panel' }],
+      menuImg ? [{ text: '‹ Back', callback_data: 'owner_panel' }] : [],
+    ].filter(r => Array.isArray(r) ? r.length : true)});
 }
 
 // ─── DETAILED STATS ───────────────────────────────────────────────────────
@@ -1458,7 +1563,7 @@ async function handleFsubVerify(query) {
   if (isMember) {
     userStates.delete(userId);
     await bot.answerCallbackQuery(query.id, { text: '✅ Access granted!', show_alert: false }).catch(() => {});
-    return bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
+    return sendWelcome(chatId, userId);
   } else {
     return bot.answerCallbackQuery(query.id, { text: '❌ You have not joined yet. Please join first!', show_alert: true }).catch(() => {});
   }
@@ -1663,6 +1768,14 @@ bot.on('message', async msg => {
       { parse_mode: 'HTML' });
   }
 
+  if (state?.mode === 'set_menu_image') {
+    userStates.delete(userId);
+    db.setSetting('menu_image', text.trim());
+    return bot.sendMessage(chatId,
+      `✅ <b>Menu image URL saved!</b>\nIt will now appear with the main menu.`,
+      { parse_mode: 'HTML' });
+  }
+
   if (state?.mode === 'set_fsub') {
     userStates.delete(userId);
     const ch = text.trim();
@@ -1729,9 +1842,7 @@ bot.on('message', async msg => {
   // ✅ FIX: Only check numbers when user is in check_single or bulk_check mode
   // If no state set, show menu — don't process random messages as numbers
   if (!state || (state.mode !== 'check_single' && state.mode !== 'bulk_check')) {
-    return bot.sendMessage(chatId,
-      `👋 Use the buttons below to check numbers.`,
-      { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
+    return sendWelcome(chatId, userId);
   }
 
   // ── Number checking ────────────────────────────────────────────────────
@@ -1785,15 +1896,21 @@ bot.on('photo', async msg => {
   const chatId = msg.chat.id;
   if (!userId || !isAdmin(userId)) return;
   const state = userStates.get(userId);
-  if (state?.mode !== 'set_fsub_image') return;
+  if (!state || !['set_fsub_image', 'set_menu_image'].includes(state.mode)) return;
   userStates.delete(userId);
-  // Get the highest resolution photo
   const photo  = msg.photo[msg.photo.length - 1];
   const fileId = photo.file_id;
-  db.setSetting('fsub_image', fileId);
-  return bot.sendMessage(chatId,
-    `✅ <b>FSub image saved!</b>\nThis photo will appear with the join prompt.`,
-    { parse_mode: 'HTML' });
+  if (state.mode === 'set_fsub_image') {
+    db.setSetting('fsub_image', fileId);
+    return bot.sendMessage(chatId,
+      `✅ <b>FSub image saved!</b>\nThis photo will appear with the join prompt.`,
+      { parse_mode: 'HTML' });
+  } else {
+    db.setSetting('menu_image', fileId);
+    return bot.sendMessage(chatId,
+      `✅ <b>Menu image saved!</b>\nThis photo will appear with the main menu.`,
+      { parse_mode: 'HTML' });
+  }
 });
 
 bot.on('document', async msg => {
