@@ -902,7 +902,7 @@ bot.on('callback_query', async query => {
     case 'menu_img_remove':
       if (!isAdmin(userId)) return;
       db.setSetting('menu_image', '');
-      return bot.sendMessage(chatId, `✅ Menu image removed.`, { parse_mode: 'HTML' }).then(() => showBotSettings(chatId, userId, msgId));
+      return showBotSettings(chatId, userId, msgId);
 
     case 'set_log_group':
       if (!isAdmin(userId)) return;
@@ -929,33 +929,41 @@ bot.on('callback_query', async query => {
 });
 
 // ─── EDIT MESSAGE HELPER ──────────────────────────────────────────────────
-// Handles both text messages AND photo messages (caption edit)
+// Smart edit: handles text messages, photo captions, and replaces photos with text
 async function editMsg(chatId, msgId, text, markup) {
-  // Try editing as text first
-  const edited = await bot.editMessageText(text, {
-    chat_id:              chatId,
-    message_id:           msgId,
-    parse_mode:           'HTML',
-    reply_markup:         markup,
+  const opts = {
+    chat_id:                  chatId,
+    message_id:               msgId,
+    parse_mode:               'HTML',
+    reply_markup:             markup,
     disable_web_page_preview: true,
-  }).catch(() => null);
+  };
 
-  if (edited) return edited;
+  // 1. Try editing as plain text message
+  const asText = await bot.editMessageText(text, opts).catch(() => null);
+  if (asText) return asText;
 
-  // If that failed, message is probably a photo — try editing its caption
-  const captionEdited = await bot.editMessageCaption(text, {
+  // 2. Message is a photo — edit its caption
+  const asCaption = await bot.editMessageCaption(text, {
     chat_id:      chatId,
     message_id:   msgId,
     parse_mode:   'HTML',
     reply_markup: markup,
   }).catch(() => null);
+  if (asCaption) return asCaption;
 
-  if (captionEdited) return captionEdited;
+  // 3. Replace photo with a plain text message using editMessageMedia
+  const asMedia = await bot.editMessageMedia(
+    { type: 'photo', media: 'https://i.imgur.com/remove.png', caption: text, parse_mode: 'HTML' },
+    { chat_id: chatId, message_id: msgId, reply_markup: markup }
+  ).catch(() => null);
+  if (asMedia) return asMedia;
 
-  // Both failed — send a fresh message
+  // 4. Last resort — delete old and send fresh (ONLY if all edits fail)
+  await bot.deleteMessage(chatId, msgId).catch(() => {});
   return bot.sendMessage(chatId, text, {
-    parse_mode:           'HTML',
-    reply_markup:         markup,
+    parse_mode:               'HTML',
+    reply_markup:             markup,
     disable_web_page_preview: true,
   }).catch(() => {});
 }
@@ -982,12 +990,7 @@ async function sendWelcome(chatId, userId) {
 
 async function showMainMenu(chatId, userId, msgId) {
   userStates.delete(userId);
-  // Try to edit existing message first; if it fails (e.g. was a photo), send fresh
-  const img = db.getSetting('menu_image') || null;
-  if (img) {
-    // Can't edit a text message into a photo — send new
-    return sendWelcome(chatId, userId);
-  }
+  // Always edit in-place — editMsg handles text/photo/caption automatically
   return editMsg(chatId, msgId, welcomeText(userId), mainMenu(userId));
 }
 
@@ -1235,8 +1238,7 @@ async function showOwnerPanel(chatId, userId, msgId) {
     [{ text: '⚙️ Settings', callback_data: 'op_settings' }],
     [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
   ]};
-  // Always sendMessage — editMsg fails silently if previous msg was a photo
-  return bot.sendMessage(chatId, opText, { parse_mode: 'HTML', reply_markup: opKb });
+  return editMsg(chatId, msgId, opText, opKb);
 }
 
 // ─── USER WA PANEL ───────────────────────────────────────────────────────────
@@ -1501,10 +1503,7 @@ async function showUsersList(chatId, userId, msgId) {
     [{ text: '‹ Back', callback_data: 'owner_panel' }],
   ]};
 
-  await bot.sendMessage(chatId, lines.join('\n'), {
-    parse_mode: 'HTML',
-    reply_markup: kb,
-  }).catch(() => {});
+  return editMsg(chatId, msgId, lines.join('\n'), kb);
 }
 
 // ─── USERS DOWNLOAD ───────────────────────────────────────────────────────
@@ -1538,7 +1537,7 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
   if (!isAdmin(adminId)) return;
   const u = db.getUser(targetId);
   if (!u) {
-    return bot.sendMessage(chatId, `❌ User not found.`, { parse_mode: 'HTML', reply_markup: backBtn });
+    return editMsg(chatId, msgId, `❌ User not found.`, backBtn);
   }
 
   const role    = u.role === 'owner' ? '👑 Owner' : u.role === 'admin' ? '⭐ Admin' : '👤 User';
@@ -1590,7 +1589,7 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
     `  └ Bonus:        <b>${u.bonus_checks || 0}</b>\n\n` +
     `📅 <b>Joined:</b> <i>${new Date(u.joined_at).toLocaleDateString()}</i>`;
 
-  return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+  return editMsg(chatId, msgId, text, kb);
 }
 
 async function handleUserBan(chatId, adminId, msgId, targetId, ban) {
@@ -1770,11 +1769,12 @@ async function setupLogGroup(chatId, userId, msgId) {
 async function handleFsubVerify(query) {
   const userId = query.from.id;
   const chatId = query.message.chat.id;
+  const msgId  = query.message.message_id;
   const isMember = await checkForceSub(userId);
   if (isMember) {
     userStates.delete(userId);
     await bot.answerCallbackQuery(query.id, { text: '✅ Access granted!', show_alert: false }).catch(() => {});
-    return sendWelcome(chatId, userId);
+    return editMsg(chatId, msgId, welcomeText(userId), mainMenu(userId));
   } else {
     return bot.answerCallbackQuery(query.id, { text: '❌ You have not joined yet. Please join first!', show_alert: true }).catch(() => {});
   }
