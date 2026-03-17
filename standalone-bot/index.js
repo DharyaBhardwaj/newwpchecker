@@ -22,6 +22,14 @@ const db     = require('./database');
 let config;
 try { config = require('./config'); } catch (_) { config = require('./config.example'); }
 
+// ─── BOOT ENV OVERRIDES ──────────────────────────────────────────────────────
+// These run after DB is ready — called once at startup
+function applyEnvSettings() {
+  if (process.env.FSUB_CHANNEL) db.setSetting('fsub_channel', process.env.FSUB_CHANNEL);
+  if (process.env.FSUB_IMAGE)   db.setSetting('fsub_image',   process.env.FSUB_IMAGE);
+  if (process.env.MENU_IMAGE)   db.setSetting('menu_image',   process.env.MENU_IMAGE);
+}
+
 const logger = pino({ level: 'silent' });
 const app    = express();
 app.use(express.json());
@@ -1188,20 +1196,24 @@ async function showOwnerPanel(chatId, userId, msgId) {
   const maint        = isMaintenanceMode() ? '🔧 ON' : '✅ OFF';
   const paidMode     = db.getSetting('paid_mode') === 'true' ? '💰 ON' : '🆓 OFF';
 
-  return editMsg(chatId, msgId,
-    `⚙️ <b>Owner Panel</b>\n\n` +
-    `👥 Total users: <b>${totalUsers}</b> | 💎 Premium: <b>${premUsers}</b>\n` +
-    `📱 WA accounts online: <b>${activeWA}</b>\n` +
-    `🔧 Maintenance: ${maint} | 💰 Paid Mode: ${paidMode}`,
-    { inline_keyboard: [
-      [{ text: '📱 WA Accounts', callback_data: 'op_accounts' }, { text: '➕ Add Account', callback_data: 'op_add_acct' }],
-      [{ text: db.getSetting('user_wa_mode')==='on' ? '🟢 User WA: ON  — Tap to Disable' : '🔴 User WA: OFF — Tap to Enable', callback_data: 'toggle_user_wa' }],
-      [{ text: '👥 Users', callback_data: 'op_users' }, { text: '💎 Add Premium', callback_data: 'op_add_premium' }],
-      [{ text: '📢 Broadcast', callback_data: 'op_broadcast' }, { text: '📋 Logs', callback_data: 'op_logs' }],
-      [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🔒 Force Sub', callback_data: 'op_fsub' }],
-      [{ text: '⚙️ Settings', callback_data: 'op_settings' }],
-      [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
-    ]});
+  const userWaOn = db.getSetting('user_wa_mode') === 'on';
+  const opText =
+    `⚙️ <b>Admin Panel</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `👥 Users: <b>${totalUsers}</b>  |  💎 Premium: <b>${premUsers}</b>\n` +
+    `📱 WA online: <b>${activeWA}</b>  |  🔧 Maint: ${maint}\n` +
+    `💰 Paid Mode: ${paidMode}`;
+  const opKb = { inline_keyboard: [
+    [{ text: '📱 WA Accounts', callback_data: 'op_accounts' }, { text: '➕ Add Account', callback_data: 'op_add_acct' }],
+    [{ text: userWaOn ? '🟢 User WA: ON — Disable' : '🔴 User WA: OFF — Enable', callback_data: 'toggle_user_wa' }],
+    [{ text: '👥 Users', callback_data: 'op_users' }, { text: '💎 Add Premium', callback_data: 'op_add_premium' }],
+    [{ text: '📢 Broadcast', callback_data: 'op_broadcast' }, { text: '📋 Logs', callback_data: 'op_logs' }],
+    [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🔒 Force Sub', callback_data: 'op_fsub' }],
+    [{ text: '⚙️ Settings', callback_data: 'op_settings' }],
+    [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+  ]};
+  // Always sendMessage — editMsg fails silently if previous msg was a photo
+  return bot.sendMessage(chatId, opText, { parse_mode: 'HTML', reply_markup: opKb });
 }
 
 // ─── USER WA PANEL ───────────────────────────────────────────────────────────
@@ -2349,6 +2361,7 @@ app.get('/health', (_, res) => {
 const PORT = config.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
+  applyEnvSettings();
   await connectAllSaved();
   console.log('✅ WhatsApp Number Checker Bot started!');
 });
