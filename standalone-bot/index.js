@@ -266,13 +266,33 @@ async function promoteBackupAccount() {
 async function connectAllSaved() {
   const saved = db.getAllAccounts();
   if (!saved.length) return;
+  console.log(`[Boot] Restoring ${saved.length} saved WA account(s)...`);
   for (const a of saved) {
     if (!a.is_enabled) {
-      accounts.set(a.account_id, { status: 'banned', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: a.phone_number, accountType: a.account_type });
+      accounts.set(a.account_id, {
+        status: 'banned', sock: null, qrCode: null,
+        retryCount: 0, retryTimer: null,
+        phoneNumber: a.phone_number, accountType: a.account_type
+      });
       continue;
     }
-    // ✅ Always attempt reconnect — loadSession will pull from Supabase if no local files
-    await connectAccount(a.account_id, a.account_type || 'checker');
+    const dir = getSessionDir(a.account_id);
+    const hasLocalSession = fs.existsSync(dir) && fs.readdirSync(dir).length > 0;
+    const hasSupabase = !!supabase;
+
+    if (hasLocalSession || hasSupabase) {
+      // Has session data — attempt reconnect
+      console.log(`[Boot] Connecting: ${a.account_id} (local=${hasLocalSession}, supabase=${hasSupabase})`);
+      await connectAccount(a.account_id, a.account_type || 'checker');
+    } else {
+      // No session at all — mark disconnected, needs manual QR/pair
+      accounts.set(a.account_id, {
+        status: 'disconnected', sock: null, qrCode: null,
+        retryCount: 0, retryTimer: null,
+        phoneNumber: a.phone_number, accountType: a.account_type || 'checker'
+      });
+      console.log(`[Boot] No session for ${a.account_id} — needs QR/pair`);
+    }
   }
 }
 
@@ -427,6 +447,15 @@ const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, {
 });
 bot.deleteWebHook({ drop_pending_updates: true }).catch(() => {});
 
+// Dedup set — prevents same message being processed by both onText and on('message')
+const _processedMsgIds = new Set();
+function markMsg(id) {
+  _processedMsgIds.add(id);
+  // cleanup after 10s to avoid memory leak
+  setTimeout(() => _processedMsgIds.delete(id), 10_000);
+}
+function alreadyHandled(id) { return _processedMsgIds.has(id); }
+
 let pollingResetInFlight = false;
 bot.on('polling_error', async err => {
   const m = err?.message || String(err);
@@ -541,6 +570,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const refCode  = match?.[1]?.trim();
 
   if (isMaintenanceMode() && !isAdmin(userId)) {
+    markMsg(msg.message_id);
     return bot.sendMessage(chatId,
       `🔧 <b>Maintenance Mode</b>\n\nThe bot is currently under maintenance. Please check back later.`,
       { parse_mode: 'HTML' });
@@ -573,6 +603,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     const info = await getFsubChannelInfo();
     const linkText = info?.link || info?.id || '';
     const title = info?.title || 'our channel';
+    markMsg(msg.message_id);
     return bot.sendMessage(chatId,
       `🔒 <b>Access Required</b>\n\nTo use this bot, you must join:\n\n👉 <b><a href="${esc(linkText)}">${esc(title)}</a></b>\n\nAfter joining, click /start again.`,
       { parse_mode: 'HTML', disable_web_page_preview: false });
@@ -580,7 +611,8 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
   // Clear any stale state on /start
   userStates.delete(userId);
-  // ONE message only
+  // Mark this message ID as handled so bot.on('message') ignores it
+  markMsg(msg.message_id);
   return bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
 });
 
@@ -685,6 +717,7 @@ bot.on('callback_query', async query => {
     case 'op_accounts':  return showWaAccounts(chatId, userId, msgId);
     case 'op_add_acct':  return startAddAccount(chatId, userId, msgId);
     case 'op_users':     return showUsersList(chatId, userId, msgId);
+    case 'op_users_dl':  return handleUsersDownload(chatId, userId);
     case 'op_broadcast': return startBroadcast(chatId, userId, msgId);
     case 'op_fsub':      return showFsubSettings(chatId, userId, msgId);
     case 'op_settings':  return showBotSettings(chatId, userId, msgId);
@@ -1089,23 +1122,57 @@ async function showUsersList(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
   const allUsers = db.getAllUsers();
   const total    = allUsers.length;
-  const users    = allUsers.slice(0, 20);
 
-  const kb = users.map(u => {
-    const role = u.role === 'owner' ? '👑' : u.role === 'admin' ? '⭐' : db.isPremiumActive(u.telegram_id) ? '💎' : u.is_blocked ? '🚫' : '👤';
-    const name = (u.username || 'noname').slice(0, 15);
-    // callback_data must be under 64 bytes — just use ID
-    return [{ text: `${role} ${u.telegram_id} @${name}`, callback_data: `user_info_${u.telegram_id}` }];
-  });
-  kb.push([{ text: '‹ Back', callback_data: 'owner_panel' }]);
+  // Build user list text inline — NO separate buttons per user
+  let lines = [`👥 <b>Users (${total} total)</b>\n`];
+  for (const u of allUsers.slice(0, 50)) {
+    const roleIcon = u.role === 'owner' ? '👑' : u.role === 'admin' ? '⭐' : db.isPremiumActive(u.telegram_id) ? '💎' : u.is_blocked ? '🚫' : '👤';
+    const name = u.username ? `@${u.username}` : 'no_username';
+    const prem = db.isPremiumActive(u.telegram_id) ? ' [P]' : '';
+    const ban  = u.is_blocked ? ' [BAN]' : '';
+    lines.push(`${roleIcon} <code>${u.telegram_id}</code> ${esc(name)}${prem}${ban}`);
+  }
+  if (total > 50) lines.push(`\n<i>...and ${total - 50} more</i>`);
+  lines.push(`\n<i>Tap a user ID to manage: /user &lt;id&gt;</i>`);
 
-  const text = `👥 <b>Users (${total} total)</b>\n\nShowing first ${users.length}.\nUse /user &lt;id&gt; for a specific user.`;
+  const kb = { inline_keyboard: [
+    [
+      { text: '📥 Download All (.txt)', callback_data: 'op_users_dl' },
+      { text: '🔄 Refresh', callback_data: 'op_users' },
+    ],
+    [{ text: '‹ Back', callback_data: 'owner_panel' }],
+  ]};
 
-  // sendMessage instead of editMsg — avoids silent failures with large keyboards
-  await bot.sendMessage(chatId, text, {
+  await bot.sendMessage(chatId, lines.join('\n'), {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: kb },
+    reply_markup: kb,
   }).catch(() => {});
+}
+
+// ─── USERS DOWNLOAD ───────────────────────────────────────────────────────
+async function handleUsersDownload(chatId, userId) {
+  if (!isAdmin(userId)) return;
+  const allUsers = db.getAllUsers();
+  let txt = `WhatsApp Checker Bot — Users Export\n`;
+  txt += `Total: ${allUsers.length} | Exported: ${new Date().toISOString()}\n`;
+  txt += '='.repeat(60) + '\n\n';
+  for (const u of allUsers) {
+    const prem = db.isPremiumActive(u.telegram_id);
+    txt += `ID:       ${u.telegram_id}\n`;
+    txt += `Username: @${u.username || 'N/A'}\n`;
+    txt += `Name:     ${u.first_name || 'N/A'}\n`;
+    txt += `Role:     ${u.role}\n`;
+    txt += `Premium:  ${prem ? (u.premium_until ? 'Yes until ' + u.premium_until : 'Lifetime') : 'No'}\n`;
+    txt += `Banned:   ${u.is_blocked ? 'Yes' : 'No'}\n`;
+    txt += `Checks:   ${u.numbers_checked || 0}\n`;
+    txt += `Joined:   ${u.joined_at}\n`;
+    txt += '-'.repeat(40) + '\n';
+  }
+  await bot.sendDocument(chatId,
+    Buffer.from(txt, 'utf-8'),
+    { caption: `📥 <b>All Users Export</b>\n${allUsers.length} users`, parse_mode: 'HTML' },
+    { filename: `users_${Date.now()}.txt`, contentType: 'text/plain' }
+  ).catch(() => {});
 }
 
 // ─── USER INFO ────────────────────────────────────────────────────────────
@@ -1334,14 +1401,16 @@ async function handleExportProfile(chatId, userId) {
 // ════════════════════════════════════════════════════════════════════════════
 
 bot.on('message', async msg => {
+  // If this message was already handled by an onText handler — skip it entirely
+  if (alreadyHandled(msg.message_id)) return;
+
   const chatId    = msg.chat.id;
   const userId    = msg.from.id;
   const username  = msg.from.username || '';
   const firstName = msg.from.first_name || '';
   const text      = msg.text;
 
-  // ✅ FIX: Ignore ALL commands — onText handles them separately
-  // This prevents /start from firing BOTH onText AND message handler (double message bug)
+  // Ignore all slash commands — handled by onText listeners
   if (!text || text.startsWith('/')) return;
 
   // ✅ FIX: Ignore forwarded messages and channel posts
