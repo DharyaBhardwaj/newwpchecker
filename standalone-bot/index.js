@@ -1,465 +1,419 @@
-const express = require('express');
+// ════════════════════════════════════════════════════════════════════════════
+//  WhatsApp Number Checker Bot  —  Professional Edition
+//  Author: Dhairya Bhardwaj | @Bhardwa_j
+// ════════════════════════════════════════════════════════════════════════════
+
+'use strict';
+
+const express    = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const {
+  useMultiFileAuthState, DisconnectReason,
+  fetchLatestBaileysVersion, makeCacheableSignalKeyStore
+} = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
-const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
-const db = require('./database');
+const pino   = require('pino');
+const fs     = require('fs');
+const path   = require('path');
+const db     = require('./database');
 
-// Load config
+// ─── CONFIG ─────────────────────────────────────────────────────────────────
 let config;
-try { config = require('./config'); } catch (e) { config = require('./config.example'); }
+try { config = require('./config'); } catch (_) { config = require('./config.example'); }
 
-const logger = pino({ level: 'info' });
-const app = express();
+const logger = pino({ level: 'silent' }); // set 'info' for debug
+const app    = express();
 app.use(express.json());
 
-// ========== SUPABASE ==========
+// ─── SUPABASE ────────────────────────────────────────────────────────────────
 let supabase = null;
 if (config.SUPABASE_URL && config.SUPABASE_SERVICE_KEY) {
   const { createClient } = require('@supabase/supabase-js');
   supabase = createClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY);
-  logger.info('Supabase initialized');
 }
 
-// ========== DATA DIR ==========
+// ─── DATA DIR ────────────────────────────────────────────────────────────────
 const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : (fs.existsSync('/var/data') ? '/var/data' : path.join(__dirname, 'data'));
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ========== MULTI-ACCOUNT STATE ==========
-// accountId => { sock, status, qrCode, retryCount, retryTimer, phoneNumber }
-// status: 'disconnected' | 'connecting' | 'waiting_for_scan' | 'connected' | 'banned'
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function fmt(n) { return Number(n || 0).toLocaleString(); }
+
+function progressBar(done, total) {
+  const pct  = total === 0 ? 0 : Math.floor((done / total) * 100);
+  const fill = Math.round((pct / 100) * 16);
+  return '▓'.repeat(fill) + '░'.repeat(16 - fill);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MULTI-ACCOUNT WHATSAPP ENGINE
+// ════════════════════════════════════════════════════════════════════════════
+
+// In-memory state: accountId → { sock, status, qrCode, retryCount, retryTimer, phoneNumber }
 const accounts = new Map();
 
-function getSessionDir(accountId) {
-  return path.join(DATA_DIR, 'auth_' + accountId);
-}
+function getSessionDir(id) { return path.join(DATA_DIR, 'wa_' + id); }
 
-function getConnectedAccounts() {
-  const result = [];
-  for (const [id, state] of accounts.entries()) {
-    if (state.status === 'connected' && state.sock) result.push({ id, ...state });
+function getConnectedCheckers() {
+  const res = [];
+  for (const [id, s] of accounts) {
+    if (s.status === 'connected' && s.sock && s.accountType === 'checker') res.push({ id, ...s });
   }
-  return result;
+  return res;
 }
 
-function hasAnyConnected() {
-  return getConnectedAccounts().length > 0;
-}
+function hasAnyChecker() { return getConnectedCheckers().length > 0; }
 
-// ========== SUPABASE SESSION ==========
-async function saveSessionToSupabase(accountId) {
+// ─── SUPABASE SESSION PERSISTENCE ─────────────────────────────────────────
+async function saveSession(accountId) {
   if (!supabase) return;
-  const sessionDir = getSessionDir(accountId);
+  const dir = getSessionDir(accountId);
   try {
-    if (!fs.existsSync(sessionDir)) return;
-    const files = fs.readdirSync(sessionDir);
-    const sessionData = {};
-    for (const file of files) {
-      sessionData[file] = fs.readFileSync(path.join(sessionDir, file), 'utf-8');
-    }
+    if (!fs.existsSync(dir)) return;
+    const data = {};
+    for (const f of fs.readdirSync(dir)) data[f] = fs.readFileSync(path.join(dir, f), 'utf-8');
     await supabase.from('whatsapp_sessions').upsert({
-      session_id: accountId,
-      session_data: sessionData,
+      session_id:   accountId,
+      session_data: data,
       is_connected: accounts.get(accountId)?.status === 'connected',
       phone_number: accounts.get(accountId)?.phoneNumber || null,
-      updated_at: new Date().toISOString()
+      updated_at:   new Date().toISOString()
     }, { onConflict: 'session_id' });
-    logger.info(`[${accountId}] Session saved to Supabase`);
-  } catch (err) {
-    logger.error(`[${accountId}] Supabase save error:`, err);
-  }
-}
-
-async function loadSessionFromSupabase(accountId) {
-  if (!supabase) return false;
-  const sessionDir = getSessionDir(accountId);
-  try {
-    const { data } = await supabase
-      .from('whatsapp_sessions')
-      .select('session_data')
-      .eq('session_id', accountId)
-      .single();
-    if (data?.session_data && Object.keys(data.session_data).length > 0) {
-      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-      for (const [filename, content] of Object.entries(data.session_data)) {
-        fs.writeFileSync(path.join(sessionDir, filename), content);
-      }
-      logger.info(`[${accountId}] Session loaded from Supabase`);
-      return true;
-    }
-  } catch (err) {
-    logger.error(`[${accountId}] Supabase load error:`, err);
-  }
-  return false;
-}
-
-async function clearSessionFromSupabase(accountId) {
-  if (!supabase) return;
-  try {
-    await supabase.from('whatsapp_sessions')
-      .update({ session_data: {}, is_connected: false, updated_at: new Date().toISOString() })
-      .eq('session_id', accountId);
   } catch (_) {}
 }
 
-async function clearAccountSession(accountId) {
-  const sessionDir = getSessionDir(accountId);
-  if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-  await clearSessionFromSupabase(accountId);
-  db.setAccountConnected(accountId, false);
+async function loadSession(accountId) {
+  if (!supabase) return false;
+  const dir = getSessionDir(accountId);
+  try {
+    const { data } = await supabase.from('whatsapp_sessions')
+      .select('session_data').eq('session_id', accountId).single();
+    if (data?.session_data && Object.keys(data.session_data).length > 0) {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      for (const [f, c] of Object.entries(data.session_data))
+        fs.writeFileSync(path.join(dir, f), c);
+      return true;
+    }
+  } catch (_) {}
+  return false;
 }
 
-// ========== CONNECT SINGLE ACCOUNT ==========
-const MAX_RETRIES = 50;
+async function wipeSession(accountId) {
+  const dir = getSessionDir(accountId);
+  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  db.setAccountConnected(accountId, false);
+  if (supabase) {
+    try {
+      await supabase.from('whatsapp_sessions')
+        .update({ session_data: {}, is_connected: false, updated_at: new Date().toISOString() })
+        .eq('session_id', accountId);
+    } catch (_) {}
+  }
+}
 
-async function connectAccount(accountId) {
-  const existing = accounts.get(accountId);
-  if (existing?.status === 'connected') return;
+// ─── CONNECT ONE ACCOUNT ──────────────────────────────────────────────────
+const MAX_RETRY = 50;
 
-  db.addAccount(accountId);
+async function connectAccount(accountId, accountType = 'checker') {
+  if (accounts.get(accountId)?.status === 'connected') return;
+
+  db.addAccount(accountId, accountId, accountType);
+  const dbAcct = db.getAccount(accountId);
+  const type   = dbAcct?.account_type || accountType;
 
   if (!accounts.has(accountId)) {
-    accounts.set(accountId, { status: 'connecting', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: null });
+    accounts.set(accountId, { status: 'connecting', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: null, accountType: type });
   } else {
-    const s = accounts.get(accountId);
-    s.status = 'connecting';
-    s.qrCode = null;
+    Object.assign(accounts.get(accountId), { status: 'connecting', qrCode: null, accountType: type });
   }
 
-  logger.info(`[${accountId}] Connecting...`);
+  await loadSession(accountId);
+
+  const dir = getSessionDir(accountId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   try {
-    await loadSessionFromSupabase(accountId);
-
-    const sessionDir = getSessionDir(accountId);
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
+    const { state, saveCreds } = await useMultiFileAuthState(dir);
+    const { version }          = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+        keys:  makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
       },
-      printQRInTerminal: false,
-      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      printQRInTerminal:          false,
+      browser:                    ['Ubuntu', 'Chrome', '20.0.04'],
       generateHighQualityLinkPreview: false,
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
-      keepAliveIntervalMs: 30_000,
-      connectTimeoutMs: 60_000,
-      defaultQueryTimeoutMs: 60_000,
+      syncFullHistory:            false,
+      markOnlineOnConnect:        false,
+      keepAliveIntervalMs:        30_000,
+      connectTimeoutMs:           60_000,
+      defaultQueryTimeoutMs:      60_000,
     });
 
     accounts.get(accountId).sock = sock;
 
     sock.ev.on('creds.update', async () => {
-      try { await saveCreds(); await saveSessionToSupabase(accountId); } catch (e) {}
+      try { await saveCreds(); await saveSession(accountId); } catch (_) {}
     });
 
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', async update => {
       const { connection, lastDisconnect, qr } = update;
       const acct = accounts.get(accountId);
       if (!acct) return;
 
       if (qr) {
-        acct.qrCode = await QRCode.toDataURL(qr);
-        acct.status = 'waiting_for_scan';
-        logger.info(`[${accountId}] QR generated`);
+        acct.qrCode  = await QRCode.toDataURL(qr);
+        acct.status  = 'waiting_for_scan';
       }
 
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const isBanned = statusCode === DisconnectReason.loggedOut;
+        const code     = lastDisconnect?.error?.output?.statusCode;
+        const isBanned = code === DisconnectReason.loggedOut;
 
-        logger.warn(`[${accountId}] Disconnected — code: ${statusCode}`);
         acct.status = isBanned ? 'banned' : 'disconnected';
-        acct.sock = null;
+        acct.sock   = null;
         acct.qrCode = null;
         db.setAccountConnected(accountId, false);
 
         if (isBanned) {
-          db.incrementBanCount(accountId); // also disables the account in DB
-          logger.warn(`[${accountId}] BANNED! Auto-disabled.`);
-          notifyAdminsBan(accountId);
-          await clearAccountSession(accountId);
+          db.incrementBanCount(accountId);
+          sendLog(`🚫 <b>Account Banned</b>\n\nID: <code>${esc(accountId)}</code>\n\nAuto-disabled. Promoting backup account...`);
+          await wipeSession(accountId);
+          // Promote a backup account automatically
+          await promoteBackupAccount();
           return;
         }
 
-        // Auto-reconnect with exponential backoff
-        if (acct.retryCount < MAX_RETRIES) {
+        if (acct.retryCount < MAX_RETRY) {
           acct.retryCount++;
           const backoff = Math.min(30_000, 2_000 * acct.retryCount);
-          logger.info(`[${accountId}] Retry ${acct.retryCount} in ${backoff}ms`);
-          acct.retryTimer = setTimeout(() => connectAccount(accountId), backoff);
-        } else {
-          logger.error(`[${accountId}] Max retries reached`);
+          acct.retryTimer = setTimeout(() => connectAccount(accountId, type), backoff);
         }
       }
 
       if (connection === 'open') {
-        acct.status = 'connected';
-        acct.qrCode = null;
-        acct.retryCount = 0;
+        acct.status      = 'connected';
+        acct.qrCode      = null;
+        acct.retryCount  = 0;
         acct.phoneNumber = sock.user?.id?.split(':')[0] || null;
         db.setAccountConnected(accountId, true, acct.phoneNumber);
-        await saveSessionToSupabase(accountId);
-        logger.info(`[${accountId}] Connected! Phone: ${acct.phoneNumber}`);
-        notifyAdminsConnected(accountId, acct.phoneNumber);
+        await saveSession(accountId);
+        sendLog(`✅ <b>Account Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>${acct.phoneNumber}</code>\nType: <code>${type}</code>`);
       }
     });
 
   } catch (err) {
-    logger.error(`[${accountId}] Connection error:`, err);
     const acct = accounts.get(accountId);
     if (acct) acct.status = 'disconnected';
   }
 }
 
-// ========== BOOT: CONNECT ALL SAVED ACCOUNTS ==========
-async function connectAllSavedAccounts() {
-  const saved = db.getAllAccounts();
-  if (saved.length === 0) {
-    logger.info('No WA accounts found. Add one via Telegram bot.');
-    return;
+// ─── PROMOTE BACKUP TO CHECKER ────────────────────────────────────────────
+async function promoteBackupAccount() {
+  const backups = db.getEnabledBackupAccounts();
+  for (const b of backups) {
+    const s = accounts.get(b.account_id);
+    if (s?.status === 'connected') {
+      db.setAccountType(b.account_id, 'checker');
+      if (s) s.accountType = 'checker';
+      sendLog(`🔄 <b>Backup Promoted</b>\n\n<code>${esc(b.account_id)}</code> is now a checker account.`);
+      return;
+    }
   }
-  logger.info(`Found ${saved.length} saved account(s). Connecting...`);
-  for (const acct of saved) {
-    if (!acct.is_enabled) {
-      logger.info(`[${acct.account_id}] Skipped (disabled/banned)`);
-      accounts.set(acct.account_id, { status: 'banned', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: acct.phone_number });
+  // Try connecting a disconnected backup
+  for (const b of backups) {
+    const s = accounts.get(b.account_id);
+    if (!s || s.status !== 'connected') {
+      db.setAccountType(b.account_id, 'checker');
+      await connectAccount(b.account_id, 'checker');
+      sendLog(`🔄 <b>Backup Promoted & Connecting</b>\n\n<code>${esc(b.account_id)}</code>`);
+      return;
+    }
+  }
+  sendLog(`⚠️ <b>No backup accounts available!</b>\n\nPlease add a new WhatsApp account.`);
+}
+
+// ─── CONNECT ALL SAVED ON BOOT ─────────────────────────────────────────────
+async function connectAllSaved() {
+  const saved = db.getAllAccounts();
+  if (!saved.length) return;
+  for (const a of saved) {
+    if (!a.is_enabled) {
+      accounts.set(a.account_id, { status: 'banned', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: a.phone_number, accountType: a.account_type });
       continue;
     }
-    const sessionDir = getSessionDir(acct.account_id);
-    const hasLocal = fs.existsSync(sessionDir) && fs.readdirSync(sessionDir).length > 0;
+    const dir = getSessionDir(a.account_id);
+    const hasLocal = fs.existsSync(dir) && fs.readdirSync(dir).length > 0;
     if (hasLocal || supabase) {
-      await connectAccount(acct.account_id);
+      await connectAccount(a.account_id, a.account_type || 'checker');
     } else {
-      logger.info(`[${acct.account_id}] No session, skipping auto-connect`);
-      accounts.set(acct.account_id, { status: 'disconnected', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: acct.phone_number });
+      accounts.set(a.account_id, { status: 'disconnected', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: a.phone_number, accountType: a.account_type });
     }
   }
 }
 
-// ========== DISCONNECT ACCOUNT ==========
+// ─── DISCONNECT ───────────────────────────────────────────────────────────
 async function disconnectAccount(accountId) {
-  const acct = accounts.get(accountId);
-  if (acct?.retryTimer) clearTimeout(acct.retryTimer);
-  if (acct?.sock) {
-    try { await acct.sock.logout(); } catch (_) {}
-    acct.sock = null;
-  }
-  if (acct) acct.status = 'disconnected';
-  await clearAccountSession(accountId);
+  const a = accounts.get(accountId);
+  if (a?.retryTimer) clearTimeout(a.retryTimer);
+  if (a?.sock) { try { await a.sock.logout(); } catch (_) {} a.sock = null; }
+  if (a) a.status = 'disconnected';
+  await wipeSession(accountId);
 }
 
-// ========== CHECK SINGLE NUMBER ON ONE ACCOUNT ==========
-async function checkNumberOnAccount(accountId, phoneNumber) {
-  const acct = accounts.get(accountId);
-  if (!acct?.sock || acct.status !== 'connected') {
-    return { phone_number: phoneNumber, is_registered: null, error: 'Account not connected', account: accountId };
-  }
+// ─── CHECK ONE NUMBER ─────────────────────────────────────────────────────
+async function checkNumber(accountId, phone) {
+  const a = accounts.get(accountId);
+  if (!a?.sock || a.status !== 'connected')
+    return { phone_number: phone, is_registered: null, error: 'not_connected' };
   try {
-    const formatted = phoneNumber.replace(/[^\d]/g, '');
-    const [result] = await acct.sock.onWhatsApp(`${formatted}@s.whatsapp.net`);
-    db.incrementAccountChecks(accountId, 1);
-    return { phone_number: phoneNumber, is_registered: result?.exists === true, account: accountId };
-  } catch (err) {
-    logger.error(`[${accountId}] Check error for ${phoneNumber}:`, err);
-    return { phone_number: phoneNumber, is_registered: false, error: err.message, account: accountId };
+    const num = phone.replace(/\D/g, '');
+    const [r]  = await a.sock.onWhatsApp(`${num}@s.whatsapp.net`);
+    db.incrementAccountChecks(accountId);
+    return { phone_number: phone, is_registered: r?.exists === true };
+  } catch (e) {
+    return { phone_number: phone, is_registered: false, error: e.message };
   }
 }
 
-// ========== LOAD BALANCED BULK CHECK ==========
-// Numbers distribute karo connected accounts mein.
-// Agar koi account beech mein down ho — uske numbers wapas queue mein.
-async function checkNumbersBalanced(numbers, onProgress) {
+// ─── LOAD-BALANCED BULK CHECK ─────────────────────────────────────────────
+async function bulkCheck(numbers, onProgress) {
   const results = new Array(numbers.length).fill(null);
-  // Pending = { idx, num }
-  let pending = numbers.map((num, idx) => ({ idx, num }));
-  let done = 0;
+  let pending   = numbers.map((num, idx) => ({ idx, num }));
+  let done      = 0;
 
   while (pending.length > 0) {
-    const active = getConnectedAccounts();
-
-    if (active.length === 0) {
-      logger.warn('No connected accounts. Waiting 10s for reconnect...');
+    const checkers = getConnectedCheckers();
+    if (!checkers.length) {
       await sleep(10_000);
-      if (getConnectedAccounts().length === 0) {
-        // Give up — mark remaining as unknown
-        for (const { idx, num } of pending) {
-          results[idx] = { phone_number: num, is_registered: null, error: 'No accounts available' };
-        }
+      if (!getConnectedCheckers().length) {
+        for (const { idx, num } of pending)
+          results[idx] = { phone_number: num, is_registered: null, error: 'no_accounts' };
         break;
       }
       continue;
     }
 
-    // Distribute pending numbers evenly across active accounts
-    const chunks = distributeToAccounts(pending, active);
-    pending = []; // Will be repopulated if any account fails mid-run
+    const chunks = distribute(pending, checkers);
+    pending = [];
 
-    // All accounts work in parallel
-    const failedByAccount = await Promise.all(
-      chunks.map(async ({ accountId, items }) => {
-        const failed = [];
-        for (const { idx, num } of items) {
-          // Re-check status before each number
-          const acct = accounts.get(accountId);
-          if (!acct || acct.status !== 'connected') {
-            failed.push({ idx, num });
-            continue;
-          }
-          const result = await checkNumberOnAccount(accountId, num);
-          results[idx] = result;
-          done++;
-          if (onProgress) onProgress(done, numbers.length);
-          await sleep(50); // 50ms delay between checks per account
-        }
-        return failed;
-      })
-    );
+    const failed = await Promise.all(chunks.map(async ({ accountId, items }) => {
+      const fail = [];
+      for (const { idx, num } of items) {
+        const a = accounts.get(accountId);
+        if (!a || a.status !== 'connected') { fail.push({ idx, num }); continue; }
+        results[idx] = await checkNumber(accountId, num);
+        done++;
+        if (onProgress) onProgress(done, numbers.length);
+        await sleep(50);
+      }
+      return fail;
+    }));
 
-    // Re-queue failed items for redistribution to other accounts
-    for (const failed of failedByAccount) {
-      for (const item of failed) pending.push(item);
-    }
-
-    if (pending.length > 0) {
-      logger.info(`${pending.length} numbers need redistribution (account went down)...`);
-      await sleep(2_000);
-    }
+    for (const f of failed) for (const item of f) pending.push(item);
+    if (pending.length) await sleep(2_000);
   }
 
   return results;
 }
 
-// Numbers ko N accounts mein equally baantna
-function distributeToAccounts(items, activeAccounts) {
-  const chunks = activeAccounts.map(a => ({ accountId: a.id, items: [] }));
+function distribute(items, checkers) {
+  const chunks = checkers.map(c => ({ accountId: c.id, items: [] }));
   items.forEach((item, i) => chunks[i % chunks.length].items.push(item));
-  return chunks.filter(c => c.items.length > 0);
+  return chunks.filter(c => c.items.length);
 }
 
-// ========== PAIRING CODE ==========
-async function getPairingCode(accountId, phoneNumber) {
-  await clearAccountSession(accountId);
-  db.addAccount(accountId);
+// ─── PAIRING CODE ─────────────────────────────────────────────────────────
+async function getPairingCode(accountId, phone, accountType = 'checker') {
+  await wipeSession(accountId);
+  db.addAccount(accountId, accountId, accountType);
 
-  accounts.set(accountId, { status: 'connecting', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: null });
+  accounts.set(accountId, { status: 'connecting', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: null, accountType });
 
-  const sessionDir = getSessionDir(accountId);
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+  const dir = getSessionDir(accountId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-  const { version } = await fetchLatestBaileysVersion();
+  const { state, saveCreds } = await useMultiFileAuthState(dir);
+  const { version }          = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
     logger: pino({ level: 'silent' }),
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+      keys:  makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
     },
     printQRInTerminal: false,
-    browser: ['Ubuntu', 'Chrome', '20.0.04']
+    browser:           ['Ubuntu', 'Chrome', '20.0.04'],
   });
 
-  accounts.get(accountId).sock = sock;
+  const acct = accounts.get(accountId);
+  acct.sock  = sock;
 
-  sock.ev.on('creds.update', async () => { await saveCreds(); await saveSessionToSupabase(accountId); });
+  sock.ev.on('creds.update', async () => { await saveCreds(); await saveSession(accountId); });
 
-  sock.ev.on('connection.update', async (update) => {
+  sock.ev.on('connection.update', async update => {
     const { connection, lastDisconnect } = update;
-    const acct = accounts.get(accountId);
-    if (!acct) return;
+    const a = accounts.get(accountId);
+    if (!a) return;
     if (connection === 'open') {
-      acct.status = 'connected';
-      acct.phoneNumber = sock.user?.id?.split(':')[0] || null;
-      db.setAccountConnected(accountId, true, acct.phoneNumber);
-      await saveSessionToSupabase(accountId);
-      notifyAdminsConnected(accountId, acct.phoneNumber);
+      a.status      = 'connected';
+      a.phoneNumber = sock.user?.id?.split(':')[0] || null;
+      db.setAccountConnected(accountId, true, a.phoneNumber);
+      await saveSession(accountId);
+      sendLog(`✅ <b>Paired & Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>${a.phoneNumber}</code>`);
+      broadcastAdmins(`✅ <b>Account Connected via Pairing</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>${a.phoneNumber}</code>`);
     }
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      if (statusCode === DisconnectReason.loggedOut) {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut) {
         db.incrementBanCount(accountId);
-        notifyAdminsBan(accountId);
-        if (acct) acct.status = 'banned';
-      } else {
-        if (acct) { acct.status = 'disconnected'; acct.sock = null; }
+        if (a) a.status = 'banned';
+      } else if (a) {
+        a.status = 'disconnected';
+        a.sock   = null;
+        // Auto-reconnect after pairing is done
+        if (a.retryCount < MAX_RETRY) {
+          a.retryCount++;
+          const backoff = Math.min(30_000, 2_000 * a.retryCount);
+          a.retryTimer  = setTimeout(() => connectAccount(accountId, accountType), backoff);
+        }
       }
     }
   });
 
-  await sleep(2000);
-  const formatted = phoneNumber.replace(/[^\d]/g, '');
-  const code = await sock.requestPairingCode(formatted);
+  // Wait for socket to be ready before requesting code
+  await sleep(3000);
+  const formatted = phone.replace(/\D/g, '');
+  const code      = await sock.requestPairingCode(formatted);
   return code;
 }
 
-// ========== ADMIN NOTIFICATIONS ==========
-function notifyAdminsBan(accountId) {
-  const acct = db.getAccount(accountId);
-  const label = escapeHtml(acct?.label || accountId);
-  const phone = acct?.phone_number || 'unknown';
-  broadcastToAdmins(`⚠️ <b>WhatsApp Account Banned!</b>\n\nAccount: <code>${label}</code>\nPhone: <code>${phone}</code>\n\nAuto-disabled. Add a new account via ➕ Add Account button.`);
-}
+// ════════════════════════════════════════════════════════════════════════════
+//  TELEGRAM BOT
+// ════════════════════════════════════════════════════════════════════════════
 
-function notifyAdminsConnected(accountId, phoneNumber) {
-  const acct = db.getAccount(accountId);
-  const label = escapeHtml(acct?.label || accountId);
-  broadcastToAdmins(`✅ <b>WhatsApp Connected</b>\n\nAccount: <code>${label}</code>\nPhone: <code>${phoneNumber || 'unknown'}</code>`);
-}
-
-function broadcastToAdmins(msg) {
-  const admins = db.getAdmins();
-  const targets = new Set(admins.map(u => u.telegram_id));
-  if (config.OWNER_ID) targets.add(config.OWNER_ID);
-  (config.ADMIN_IDS || []).forEach(id => targets.add(id));
-  for (const id of targets) {
-    bot.sendMessage(id, msg, { parse_mode: 'HTML' }).catch(() => {});
-  }
-}
-
-// ========== HELPERS ==========
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function escapeHtml(input) {
-  return String(input ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function formatProgress({ done, total, startedAt, accountCount = 1 }) {
-  const pct = total === 0 ? 0 : Math.floor((done / total) * 100);
-  const barLen = 16;
-  const filled = Math.round((pct / 100) * barLen);
-  const bar = '█'.repeat(filled) + '░'.repeat(Math.max(0, barLen - filled));
-  const elapsedMs = Date.now() - startedAt;
-  const rate = done > 0 ? elapsedMs / done : null;
-  const remainingMs = rate ? rate * (total - done) : null;
-  const etaSec = remainingMs ? Math.max(0, Math.round(remainingMs / 1000)) : null;
-  const acctLine = accountCount > 1 ? `\n🔀 <b>${accountCount} accounts</b> parallel checking` : '';
-  return `⏳ <b>Checking...</b> ${done}/${total}\n<code>${bar}</code> ${pct}%${etaSec !== null ? `\n⏱️ ETA: ~${etaSec}s` : ''}${acctLine}`;
-}
-
-// ========== TELEGRAM BOT SETUP ==========
 const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, {
   polling: { autoStart: true, interval: 1000, params: { timeout: 10 } },
 });
 bot.deleteWebHook({ drop_pending_updates: true }).catch(() => {});
 
 let pollingResetInFlight = false;
-bot.on('polling_error', async (err) => {
-  const msg = err?.message || String(err);
-  if (msg.includes('409 Conflict')) {
+bot.on('polling_error', async err => {
+  const m = err?.message || String(err);
+  if (m.includes('409')) {
     if (pollingResetInFlight) return;
     pollingResetInFlight = true;
     try { await bot.stopPolling({ cancel: true }); } catch (_) {}
@@ -467,713 +421,1236 @@ bot.on('polling_error', async (err) => {
       try { await bot.startPolling(); } catch (_) {}
       finally { setTimeout(() => { pollingResetInFlight = false; }, 10_000); }
     }, 5_000);
-    return;
   }
-  logger.error({ err: msg }, 'Telegram polling error');
 });
-async function shutdown() {
-  try { await bot.stopPolling({ cancel: true }); } catch (_) {}
-  process.exit(0);
+process.on('SIGTERM', async () => { try { await bot.stopPolling({ cancel: true }); } catch (_) {} process.exit(0); });
+process.on('SIGINT',  async () => { try { await bot.stopPolling({ cancel: true }); } catch (_) {} process.exit(0); });
+
+const userStates = new Map(); // userId → { mode, ... }
+
+// ─── LOG GROUP ────────────────────────────────────────────────────────────
+function sendLog(text) {
+  const logGroup = config.LOG_GROUP_ID || db.getSetting('log_group_id');
+  if (!logGroup) return;
+  bot.sendMessage(logGroup, text, { parse_mode: 'HTML' }).catch(() => {});
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
 
-// ========== STATE ==========
-const userStates = new Map();
+function logEvent(userId, username, action, detail = '') {
+  const u = esc(username || userId);
+  sendLog(`📋 <b>${esc(action)}</b>\n👤 @${u} (<code>${userId}</code>)\n${detail ? `ℹ️ ${esc(detail)}` : ''}`);
+}
 
-// ========== AUTH ==========
-function isAuthorized(userId, role = 'user') {
-  if (userId === config.OWNER_ID) return true;
-  if (config.ADMIN_IDS?.includes(userId)) return true;
-  const user = db.getUser(userId);
-  if (!user || user.is_blocked) return false;
-  if (role === 'admin') return user.role === 'admin' || user.role === 'owner';
-  const paidMode = db.getSetting('paid_mode') === 'true';
-  if (paidMode) {
-    if (!user.expires_at) return false;
-    if (new Date(user.expires_at) < new Date()) return false;
-  }
+// ─── BROADCAST ────────────────────────────────────────────────────────────
+function broadcastAdmins(text) {
+  const admins = db.getAdmins();
+  const ids    = new Set([...admins.map(u => u.telegram_id)]);
+  if (config.OWNER_ID) ids.add(config.OWNER_ID);
+  (config.ADMIN_IDS || []).forEach(id => ids.add(id));
+  for (const id of ids) bot.sendMessage(id, text, { parse_mode: 'HTML' }).catch(() => {});
+}
+
+// ─── AUTH ─────────────────────────────────────────────────────────────────
+function isOwner(userId)  { return userId === config.OWNER_ID; }
+
+function isAdmin(userId) {
+  if (isOwner(userId)) return true;
+  if ((config.ADMIN_IDS || []).includes(userId)) return true;
+  const u = db.getUser(userId);
+  return u?.role === 'admin' || u?.role === 'owner';
+}
+
+function isAuthorized(userId) {
+  if (isAdmin(userId)) return true;
+  const u = db.getUser(userId);
+  if (!u || u.is_blocked) return false;
   const botMode = db.getSetting('bot_mode') || 'public';
-  if (botMode === 'private') return user.role !== 'user' || !!user.is_allowed;
+  if (botMode === 'private') return u.role !== 'user' || !!u.is_allowed;
   return true;
 }
 
-function ensureOwner(userId, username) {
-  const users = db.getAllUsers();
-  if (users.length === 0) { db.createUser(userId, username, 'owner'); return true; }
-  db.createUser(userId, username);
-  return false;
+function isPremium(userId) {
+  if (isAdmin(userId)) return true;
+  return db.isPremiumActive(userId);
 }
 
+function isMaintenanceMode() {
+  return db.getSetting('maintenance') === 'on';
+}
+
+// ─── KEYBOARDS ────────────────────────────────────────────────────────────
+function mainMenu(userId) {
+  const admin = isAdmin(userId);
+  const kb = [
+    [{ text: '🔍 Check Number', callback_data: 'check_number' }, { text: '📁 Bulk Check', callback_data: 'bulk_check' }],
+    [{ text: '🛠 Tools', callback_data: 'tools' }, { text: '👤 Profile', callback_data: 'profile' }],
+    [{ text: '💎 Premium', callback_data: 'premium_info' }, { text: '🔗 Referral', callback_data: 'referral' }],
+    [{ text: '📊 Status', callback_data: 'status' }, { text: '❓ Help', callback_data: 'help' }],
+  ];
+  if (admin) kb.push([{ text: '⚙️ Owner Panel', callback_data: 'owner_panel' }]);
+  return { inline_keyboard: kb };
+}
+
+const backBtn = { inline_keyboard: [[{ text: '‹ Back to Menu', callback_data: 'main_menu' }]] };
+
+// ─── WELCOME MESSAGE ──────────────────────────────────────────────────────
+function welcomeText(userId) {
+  const checkers = getConnectedCheckers();
+  const status   = checkers.length
+    ? `🟢 <b>${checkers.length}</b> account(s) online`
+    : '🔴 No accounts connected';
+  const u = db.getUser(userId);
+  const greeting = u?.is_premium ? '💎 Welcome back, Premium Member!' : '👋 Welcome!';
+  return `${greeting}\n\n<b>WhatsApp Number Checker</b>\n${status}\n\n<i>Verify if phone numbers are registered on WhatsApp — fast, accurate, and secure.</i>`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  COMMANDS & CALLBACKS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── /start ───────────────────────────────────────────────────────────────
+bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
+  const chatId   = msg.chat.id;
+  const userId   = msg.from.id;
+  const username = msg.from.username || '';
+  const firstName= msg.from.first_name || '';
+  const refCode  = match?.[1]?.trim();
+
+  // Maintenance check (except admins)
+  if (isMaintenanceMode() && !isAdmin(userId)) {
+    return bot.sendMessage(chatId,
+      `🔧 <b>Maintenance Mode</b>\n\nThe bot is currently under maintenance. Please check back later.`,
+      { parse_mode: 'HTML' });
+  }
+
+  const isNew = db.createUser(userId, username, firstName);
+
+  // Apply referral if new user and ref code given
+  if (isNew && refCode) {
+    const referrer = db.getUserByReferCode(refCode);
+    if (referrer && referrer.telegram_id !== userId) {
+      const bonusChecks = parseInt(db.getSetting('refer_bonus') || '10');
+      const applied = db.applyReferral(referrer.telegram_id, userId, bonusChecks);
+      if (applied) {
+        bot.sendMessage(referrer.telegram_id,
+          `🎉 <b>New Referral!</b>\n\n@${esc(username) || userId} joined using your link.\nYou earned <b>+${bonusChecks}</b> bonus checks!`,
+          { parse_mode: 'HTML' }).catch(() => {});
+        logEvent(userId, username, 'Joined via Referral', `Referred by ${referrer.telegram_id}`);
+      }
+    }
+  }
+
+  if (isNew) logEvent(userId, username, 'New User', firstName);
+
+  const isMember = await checkForceSub(userId);
+  if (!isMember) {
+    const ch = db.getSetting('fsub_channel');
+    return bot.sendMessage(chatId,
+      `🔒 <b>Access Required</b>\n\nPlease join our channel to use this bot:\n👉 ${esc(ch)}\n\nAfter joining, click /start again.`,
+      { parse_mode: 'HTML' });
+  }
+
+  logEvent(userId, username, '/start');
+  bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
+});
+
+// ─── FORCE SUBSCRIBE CHECK ─────────────────────────────────────────────────
 async function checkForceSub(userId) {
+  if (isAdmin(userId)) return true;
   const ch = db.getSetting('fsub_channel');
   if (!ch) return true;
   try {
-    const member = await bot.getChatMember(ch, userId);
-    return ['member', 'administrator', 'creator'].includes(member.status);
+    const m = await bot.getChatMember(ch, userId);
+    return ['member','administrator','creator'].includes(m.status);
   } catch (_) { return true; }
 }
 
-// ========== KEYBOARDS ==========
-const getMainMenuKeyboard = (userId) => {
-  const isAdmin = isAuthorized(userId, 'admin');
-  const keyboard = [
-    [{ text: '📞 Check Number', callback_data: 'check_number' }],
-    [{ text: '📁 Bulk Check (File)', callback_data: 'bulk_check' }],
-    [{ text: '🎲 Get Number', callback_data: 'get_number' }, { text: '📤 Upload', callback_data: 'upload_mode' }],
-    [{ text: '📊 Status', callback_data: 'status' }, { text: '📈 Stats', callback_data: 'stats' }],
-  ];
-  if (isAdmin) {
-    keyboard.push([{ text: '👥 Users', callback_data: 'users' }, { text: '🔄 Toggle Bot', callback_data: 'toggle_bot' }]);
-    keyboard.push([{ text: '📱 WA Accounts', callback_data: 'wa_accounts' }, { text: '➕ Add Account', callback_data: 'wa_add' }]);
-    keyboard.push([{ text: '💎 Paid Mode', callback_data: 'paid_mode' }, { text: '📢 Force Sub', callback_data: 'force_sub' }]);
-    keyboard.push([{ text: '⚙️ Limit', callback_data: 'set_limit' }]);
+// ─── CALLBACK ROUTER ──────────────────────────────────────────────────────
+bot.on('callback_query', async query => {
+  const chatId    = query.message.chat.id;
+  const userId    = query.from.id;
+  const msgId     = query.message.message_id;
+  const data      = query.data;
+  const username  = query.from.username || '';
+
+  await bot.answerCallbackQuery(query.id).catch(() => {});
+
+  if (isMaintenanceMode() && !isAdmin(userId)) {
+    return bot.sendMessage(chatId,
+      `🔧 <b>Maintenance Mode</b>\n\nBot is currently under maintenance.`,
+      { parse_mode: 'HTML' });
   }
-  return { inline_keyboard: keyboard };
-};
 
-const getBackButton = () => ({ inline_keyboard: [[{ text: '◀️ Back to Menu', callback_data: 'main_menu' }]] });
-
-function getWelcomeMessage(username, isNew) {
-  const active = getConnectedAccounts();
-  const waStatus = active.length > 0 ? `🟢 ${active.length} account(s) connected` : '🔴 No WhatsApp connected';
-  return `👋 <b>Welcome to WhatsApp Number Checker!</b>\n\n${waStatus}\n\n📱 <b>How to use:</b>\n• Single number: <code>+1234567890</code>\n• Multiple numbers (one per line)\n• Upload <code>.txt</code> file for bulk check\n\n👤 Owner: <b>Dhairya Bhardwaj</b>\n📞 Contact: @Bhardwa_j${isNew ? '\n\n👑 <b>You are now the OWNER!</b>' : ''}\n\nUse buttons below:`;
-}
-
-// ========== START ==========
-bot.onText(/\/start/, async (msg) => {
-  const { id: chatId } = msg.chat;
-  const { id: userId, username, first_name } = msg.from;
-  const isNew = ensureOwner(userId, username || first_name);
   const isMember = await checkForceSub(userId);
   if (!isMember) {
     const ch = db.getSetting('fsub_channel');
-    return bot.sendMessage(chatId, `❌ <b>Access Denied</b>\n\nJoin our channel first:\n👉 ${escapeHtml(ch)}\n\nThen click /start again.`, { parse_mode: 'HTML' });
+    return bot.answerCallbackQuery(query.id, { text: `Please join ${ch} first!`, show_alert: true });
   }
-  bot.sendMessage(chatId, getWelcomeMessage(username || first_name, isNew), { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard(userId) });
+
+  // ── Dynamic callbacks ──
+  if (data.startsWith('wa_qr_'))         return handleWaQR(chatId, userId, msgId, data.replace('wa_qr_',''));
+  if (data.startsWith('wa_pair_'))       return handleWaPairPrompt(chatId, userId, msgId, data.replace('wa_pair_',''));
+  if (data.startsWith('wa_dis_'))        return handleWaDisconnect(chatId, userId, msgId, data.replace('wa_dis_',''));
+  if (data.startsWith('wa_del_'))        return handleWaDelete(chatId, userId, msgId, data.replace('wa_del_',''));
+  if (data.startsWith('wa_type_ck_'))    return handleWaSetType(chatId, userId, msgId, data.replace('wa_type_ck_',''), 'checker');
+  if (data.startsWith('wa_type_bk_'))    return handleWaSetType(chatId, userId, msgId, data.replace('wa_type_bk_',''), 'backup');
+  if (data.startsWith('user_info_'))     return handleUserInfo(chatId, userId, msgId, parseInt(data.replace('user_info_','')));
+  if (data.startsWith('user_ban_'))      return handleUserBan(chatId, userId, msgId, parseInt(data.replace('user_ban_','')), true);
+  if (data.startsWith('user_unban_'))    return handleUserBan(chatId, userId, msgId, parseInt(data.replace('user_unban_','')), false);
+  if (data.startsWith('user_promote_'))  return handleUserRole(chatId, userId, msgId, parseInt(data.replace('user_promote_','')), 'admin');
+  if (data.startsWith('user_demote_'))   return handleUserRole(chatId, userId, msgId, parseInt(data.replace('user_demote_','')), 'user');
+  if (data.startsWith('user_remprem_'))  return handleRemovePremium(chatId, userId, msgId, parseInt(data.replace('user_remprem_','')));
+
+  switch (data) {
+    case 'main_menu':    return showMainMenu(chatId, userId, msgId);
+    case 'check_number': return showCheckNumber(chatId, userId, msgId);
+    case 'bulk_check':   return showBulkCheck(chatId, userId, msgId);
+    case 'tools':        return showTools(chatId, userId, msgId);
+    case 'profile':      return showProfile(chatId, userId, msgId);
+    case 'premium_info': return showPremiumInfo(chatId, userId, msgId);
+    case 'referral':     return showReferral(chatId, userId, msgId);
+    case 'status':       return showStatus(chatId, userId, msgId);
+    case 'help':         return showHelp(chatId, userId, msgId);
+    case 'owner_panel':  return showOwnerPanel(chatId, userId, msgId);
+
+    // Owner panel sub-menus
+    case 'op_accounts':  return showWaAccounts(chatId, userId, msgId);
+    case 'op_add_acct':  return startAddAccount(chatId, userId, msgId);
+    case 'op_users':     return showUsersList(chatId, userId, msgId);
+    case 'op_broadcast': return startBroadcast(chatId, userId, msgId);
+    case 'op_fsub':      return showFsubSettings(chatId, userId, msgId);
+    case 'op_settings':  return showBotSettings(chatId, userId, msgId);
+    case 'op_stats':     return showDetailedStats(chatId, userId, msgId);
+    case 'op_logs':      return setupLogGroup(chatId, userId, msgId);
+
+    // Settings toggles
+    case 'set_public':
+    case 'set_private':
+      if (!isAdmin(userId)) return;
+      db.setSetting('bot_mode', data === 'set_public' ? 'public' : 'private');
+      return showBotSettings(chatId, userId, msgId);
+
+    case 'maint_on':
+    case 'maint_off':
+      if (!isAdmin(userId)) return;
+      db.setSetting('maintenance', data === 'maint_on' ? 'on' : 'off');
+      return showBotSettings(chatId, userId, msgId);
+
+    case 'paid_on':
+    case 'paid_off':
+      if (!isAdmin(userId)) return;
+      db.setSetting('paid_mode', data === 'paid_on' ? 'true' : 'false');
+      return showBotSettings(chatId, userId, msgId);
+
+    case 'fsub_remove':
+      if (!isAdmin(userId)) return;
+      db.setSetting('fsub_channel', '');
+      return showFsubSettings(chatId, userId, msgId);
+
+    case 'set_fsub_input':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_fsub' });
+      return editMsg(chatId, msgId,
+        `📢 <b>Set Force Subscribe Channel</b>\n\nSend the channel username or ID:\n\n• Username: <code>@yourchannel</code>\n• ID: <code>-100xxxxxxxxxx</code>`,
+        backBtn);
+
+    case 'set_free_limit':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_free_limit' });
+      return editMsg(chatId, msgId, `⚙️ <b>Set Free User Daily Limit</b>\n\nCurrent: <code>${db.getSetting('free_limit') || 20}</code>\n\nSend new limit (1-500):`, backBtn);
+
+    case 'set_prem_limit':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_prem_limit' });
+      return editMsg(chatId, msgId, `⚙️ <b>Set Premium User Daily Limit</b>\n\nCurrent: <code>${db.getSetting('prem_limit') || 500}</code>\n\nSend new limit (1-10000):`, backBtn);
+
+    case 'set_bulk_limit':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_bulk_limit' });
+      return editMsg(chatId, msgId, `⚙️ <b>Set Bulk Check Limit</b>\n\nCurrent: <code>${db.getSetting('bulk_limit') || 100}</code>\n\nSend new limit (1-5000):`, backBtn);
+
+    case 'set_refer_bonus':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_refer_bonus' });
+      return editMsg(chatId, msgId, `⚙️ <b>Set Referral Bonus Checks</b>\n\nCurrent: <code>${db.getSetting('refer_bonus') || 10}</code>\n\nSend new value:`, backBtn);
+
+    case 'set_log_group':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_log_group' });
+      return editMsg(chatId, msgId, `📋 <b>Set Log Group</b>\n\nSend the group/channel ID where all events will be logged:\n\n<code>-100xxxxxxxxxx</code>`, backBtn);
+
+    case 'op_add_premium':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'add_premium_uid' });
+      return editMsg(chatId, msgId, `💎 <b>Add Premium</b>\n\nSend the user's Telegram ID:`, backBtn);
+
+    case 'tools_upload':
+      userStates.set(userId, { mode: 'upload' });
+      return editMsg(chatId, msgId,
+        `📤 <b>Upload Numbers</b>\n\nSend numbers (one per line) or a <code>.txt</code> file.\nThey'll be saved to your personal pool.`,
+        backBtn);
+
+    case 'tools_get':
+      return handleGetNumber(chatId, userId, msgId);
+
+    case 'tools_change':
+      return handleChangeNumber(chatId, userId, msgId);
+  }
 });
 
-// ========== WA ACCOUNTS PANEL ==========
-async function handleWaAccounts(chatId, messageId) {
-  const all = db.getAllAccounts();
+// ─── EDIT MESSAGE HELPER ──────────────────────────────────────────────────
+async function editMsg(chatId, msgId, text, markup) {
+  return bot.editMessageText(text, {
+    chat_id:    chatId,
+    message_id: msgId,
+    parse_mode: 'HTML',
+    reply_markup: markup,
+  }).catch(() => {});
+}
 
-  if (all.length === 0) {
-    return bot.editMessageText(`📱 <b>WhatsApp Accounts</b>\n\nKoi account nahi hai. Add Account se pehle ek add karo.`, {
-      chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '➕ Add Account', callback_data: 'wa_add' }], [{ text: '◀️ Back', callback_data: 'main_menu' }]] }
-    });
+async function showMainMenu(chatId, userId, msgId) {
+  userStates.delete(userId);
+  return editMsg(chatId, msgId, welcomeText(userId), mainMenu(userId));
+}
+
+// ─── CHECK NUMBER ─────────────────────────────────────────────────────────
+async function showCheckNumber(chatId, userId, msgId) {
+  userStates.set(userId, { mode: 'check_single' });
+  return editMsg(chatId, msgId,
+    `🔍 <b>Check Single Number</b>\n\nSend a phone number to verify:\n\n• With country code: <code>919876543210</code>\n• Or with +: <code>+919876543210</code>`,
+    backBtn);
+}
+
+// ─── BULK CHECK ───────────────────────────────────────────────────────────
+async function showBulkCheck(chatId, userId, msgId) {
+  const freeLimit  = parseInt(db.getSetting('free_limit')  || '20');
+  const premLimit  = parseInt(db.getSetting('prem_limit')  || '500');
+  const bulkLimit  = parseInt(db.getSetting('bulk_limit')  || '100');
+  const isPrem = isPremium(userId);
+  userStates.set(userId, { mode: 'bulk_check' });
+  return editMsg(chatId, msgId,
+    `📁 <b>Bulk Check</b>\n\nSend multiple numbers (one per line) or upload a <code>.txt</code> file.\n\n📊 <b>Your limits:</b>\n• Daily: <code>${isPrem ? premLimit : freeLimit}</code> checks\n• Per request: <code>${bulkLimit}</code> numbers\n\n${isPrem ? '💎 Premium user' : ''}`,
+    backBtn);
+}
+
+// ─── TOOLS ────────────────────────────────────────────────────────────────
+async function showTools(chatId, userId, msgId) {
+  const count = db.getNumberCount(userId);
+  return editMsg(chatId, msgId,
+    `🛠 <b>Tools</b>\n\nManage your personal number pool.\n\n📦 Numbers in pool: <code>${count}</code>`,
+    { inline_keyboard: [
+      [{ text: '📤 Upload Numbers', callback_data: 'tools_upload' }],
+      [{ text: '🎲 Get Next Number', callback_data: 'tools_get' }, { text: '🔄 Skip Number', callback_data: 'tools_change' }],
+      [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+    ]});
+}
+
+// ─── PROFILE ──────────────────────────────────────────────────────────────
+async function showProfile(chatId, userId, msgId) {
+  const u = db.getUser(userId);
+  if (!u) return;
+  const today = new Date().toISOString().split('T')[0];
+  const dailyUsed = u.daily_reset === today ? (u.daily_checks || 0) : 0;
+  const freeLimit = parseInt(db.getSetting('free_limit')  || '20');
+  const premLimit = parseInt(db.getSetting('prem_limit')  || '500');
+  const isPrem    = isPremium(userId);
+  const limit     = isPrem ? premLimit : freeLimit;
+  let premText = '';
+  if (isPrem) {
+    if (!u.premium_until) premText = '\n💎 Premium: <b>Lifetime</b>';
+    else {
+      const d = new Date(u.premium_until);
+      const diff = Math.ceil((d - new Date()) / 86400000);
+      premText = `\n💎 Premium: <b>${diff} day(s) remaining</b> (expires ${d.toLocaleDateString()})`;
+    }
+  }
+  const role  = u.role === 'owner' ? '👑 Owner' : u.role === 'admin' ? '⭐ Admin' : isPrem ? '💎 Premium' : '👤 Free';
+  const joined = new Date(u.joined_at).toLocaleDateString();
+  const kb = { inline_keyboard: [
+    [{ text: '📄 Export My Data (.txt)', callback_data: 'export_profile' }],
+    [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+  ]};
+  return editMsg(chatId, msgId,
+    `👤 <b>Your Profile</b>\n\n` +
+    `🆔 ID: <code>${userId}</code>\n` +
+    `👤 Username: @${esc(u.username) || 'N/A'}\n` +
+    `🎭 Role: ${role}${premText}\n\n` +
+    `📊 <b>Statistics</b>\n` +
+    `• Total checks: <b>${fmt(u.numbers_checked)}</b>\n` +
+    `• Today's checks: <b>${dailyUsed} / ${limit}</b>\n` +
+    `• Bonus checks: <b>${u.bonus_checks || 0}</b>\n\n` +
+    `🔗 <b>Referral</b>\n` +
+    `• Code: <code>${u.refer_code || 'N/A'}</code>\n` +
+    `• Referrals made: <b>${u.refer_count || 0}</b>\n\n` +
+    `📅 Joined: ${joined}`,
+    kb);
+}
+
+// ─── PREMIUM INFO ─────────────────────────────────────────────────────────
+async function showPremiumInfo(chatId, userId, msgId) {
+  const isPrem = isPremium(userId);
+  const u      = db.getUser(userId);
+  const freeLimit = db.getSetting('free_limit')  || '20';
+  const premLimit = db.getSetting('prem_limit')  || '500';
+  const bulkLimit = db.getSetting('bulk_limit')  || '100';
+
+  if (isPrem && u) {
+    let expText = '';
+    if (!u.premium_until) expText = '✨ <b>Lifetime Premium</b>';
+    else {
+      const d    = new Date(u.premium_until);
+      const diff = Math.ceil((d - new Date()) / 86400000);
+      expText = `⏳ <b>${diff} day(s) remaining</b>\n📅 Expires: ${d.toLocaleDateString()}`;
+    }
+    return editMsg(chatId, msgId,
+      `💎 <b>Your Premium Status</b>\n\n${expText}\n\n` +
+      `✅ Daily limit: <b>${premLimit} checks/day</b>\n` +
+      `✅ Bulk up to: <b>${bulkLimit} at once</b>\n` +
+      `✅ Priority support\n✅ No ads`,
+      backBtn);
   }
 
-  let text = `📱 <b>WhatsApp Accounts (${all.length})</b>\n\n`;
-  const keyboard = [];
+  return editMsg(chatId, msgId,
+    `💎 <b>Upgrade to Premium</b>\n\n` +
+    `<b>Free Plan:</b>\n• ${freeLimit} checks per day\n\n` +
+    `<b>Premium Plan:</b>\n✅ ${premLimit} checks per day\n✅ Bulk check up to ${bulkLimit}\n✅ Priority support\n✅ Faster results\n\n` +
+    `To purchase, contact the owner:`,
+    { inline_keyboard: [
+      [{ text: '👤 ⏤͟͞Dhairya Bhardwaj', url: 'https://t.me/bhardwa_j' }],
+      [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+    ]});
+}
 
-  for (const acct of all) {
-    const inMem = accounts.get(acct.account_id);
-    const status = inMem?.status || (acct.is_connected ? 'connected' : (acct.is_enabled ? 'disconnected' : 'banned'));
-    const emoji = { connected: '🟢', waiting_for_scan: '⏳', connecting: '🔄', banned: '🚫', disconnected: '🔴' }[status] || '🔴';
-    const phone = acct.phone_number ? `+${acct.phone_number}` : 'Not paired';
-    const disabled = !acct.is_enabled ? ' <i>[disabled]</i>' : '';
-    text += `${emoji} <b>${escapeHtml(acct.label || acct.account_id)}</b>${disabled}\n`;
-    text += `   📞 ${phone} | Checks: ${acct.total_checks} | Bans: ${acct.ban_count}\n\n`;
+// ─── REFERRAL ─────────────────────────────────────────────────────────────
+async function showReferral(chatId, userId, msgId) {
+  const u = db.getUser(userId);
+  if (!u) return;
+  const bonus   = parseInt(db.getSetting('refer_bonus') || '10');
+  const botInfo = await bot.getMe();
+  const link    = `https://t.me/${botInfo.username}?start=${u.refer_code}`;
+  return editMsg(chatId, msgId,
+    `🔗 <b>Referral Program</b>\n\n` +
+    `Invite friends and earn <b>+${bonus} checks</b> for every referral!\n\n` +
+    `📎 <b>Your Link:</b>\n<code>${link}</code>\n\n` +
+    `📊 Total referrals: <b>${u.refer_count || 0}</b>\n` +
+    `🎁 Bonus checks earned: <b>${u.bonus_checks || 0}</b>`,
+    { inline_keyboard: [
+      [{ text: '📤 Share Link', switch_inline_query: `Join using my link: ${link}` }],
+      [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+    ]});
+}
+
+// ─── STATUS ───────────────────────────────────────────────────────────────
+async function showStatus(chatId, userId, msgId) {
+  const all = db.getAllAccounts();
+  let body  = '';
+  if (!all.length) {
+    body = 'No WhatsApp accounts configured.';
+  } else {
+    for (const a of all) {
+      const s   = accounts.get(a.account_id);
+      const st  = s?.status || (a.is_connected ? 'connected' : a.is_enabled ? 'disconnected' : 'banned');
+      const em  = { connected:'🟢', waiting_for_scan:'⏳', connecting:'🔄', banned:'🚫', disconnected:'🔴' }[st] || '🔴';
+      const ph  = a.phone_number ? `+${a.phone_number}` : 'Not linked';
+      const typ = a.account_type === 'backup' ? ' [backup]' : '';
+      body += `${em} <b>${esc(a.label||a.account_id)}</b>${typ}\n`;
+      body += `   📞 ${ph}\n\n`;
+    }
+  }
+  const active = getConnectedCheckers().length;
+  return editMsg(chatId, msgId,
+    `📊 <b>System Status</b>\n\n${body}✅ Checker accounts online: <b>${active}</b>`,
+    backBtn);
+}
+
+// ─── HELP ─────────────────────────────────────────────────────────────────
+async function showHelp(chatId, userId, msgId) {
+  return editMsg(chatId, msgId,
+    `❓ <b>How to Use</b>\n\n` +
+    `<b>🔍 Check Number</b>\nSend any phone number with country code to verify if it's on WhatsApp.\n\n` +
+    `<b>📁 Bulk Check</b>\nSend multiple numbers (one per line) or upload a <code>.txt</code> file. Results sent as files for large batches.\n\n` +
+    `<b>🛠 Tools</b>\nUpload a pool of numbers and retrieve them one by one.\n\n` +
+    `<b>💎 Premium</b>\nGet higher daily limits and faster processing.\n\n` +
+    `<b>🔗 Referral</b>\nShare your link — earn bonus checks for every friend who joins.\n\n` +
+    `📞 <b>Support:</b>`,
+    { inline_keyboard: [
+      [{ text: '💬 Contact Support', url: 'https://t.me/bhardwa_j' }],
+      [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+    ]});
+}
+
+// ─── OWNER PANEL ──────────────────────────────────────────────────────────
+async function showOwnerPanel(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const totalUsers   = db.getAllUsers().length;
+  const premUsers    = db.getAllUsers().filter(u => db.isPremiumActive(u.telegram_id)).length;
+  const activeWA     = getConnectedCheckers().length;
+  const maint        = isMaintenanceMode() ? '🔧 ON' : '✅ OFF';
+  const paidMode     = db.getSetting('paid_mode') === 'true' ? '💰 ON' : '🆓 OFF';
+
+  return editMsg(chatId, msgId,
+    `⚙️ <b>Owner Panel</b>\n\n` +
+    `👥 Total users: <b>${totalUsers}</b> | 💎 Premium: <b>${premUsers}</b>\n` +
+    `📱 WA accounts online: <b>${activeWA}</b>\n` +
+    `🔧 Maintenance: ${maint} | 💰 Paid Mode: ${paidMode}`,
+    { inline_keyboard: [
+      [{ text: '📱 WA Accounts', callback_data: 'op_accounts' }, { text: '➕ Add Account', callback_data: 'op_add_acct' }],
+      [{ text: '👥 Users', callback_data: 'op_users' }, { text: '💎 Add Premium', callback_data: 'op_add_premium' }],
+      [{ text: '📢 Broadcast', callback_data: 'op_broadcast' }, { text: '📋 Logs', callback_data: 'op_logs' }],
+      [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🔒 Force Sub', callback_data: 'op_fsub' }],
+      [{ text: '⚙️ Settings', callback_data: 'op_settings' }],
+      [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+    ]});
+}
+
+// ─── WA ACCOUNTS PANEL ────────────────────────────────────────────────────
+async function showWaAccounts(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const all = db.getAllAccounts();
+  let body  = all.length ? '' : 'No accounts added yet.\n\n';
+  const kb  = [];
+
+  for (const a of all) {
+    const s   = accounts.get(a.account_id);
+    const st  = s?.status || (a.is_connected ? 'connected' : a.is_enabled ? 'disconnected' : 'banned');
+    const em  = { connected:'🟢', waiting_for_scan:'⏳', connecting:'🔄', banned:'🚫', disconnected:'🔴' }[st] || '🔴';
+    const ph  = a.phone_number ? `+${a.phone_number}` : 'Not linked';
+    const typ = a.account_type === 'backup' ? '🔒 Backup' : '✅ Checker';
+    body += `${em} <b>${esc(a.label)}</b> — ${typ}\n`;
+    body += `   📞 ${ph} | ✓ ${a.total_checks} | ⚠️ ${a.ban_count}\n\n`;
 
     const row = [];
-    if (status !== 'connected') {
-      row.push({ text: `🔌 Connect`, callback_data: `wa_connect_${acct.account_id}` });
-      row.push({ text: `🔗 Pair`, callback_data: `wa_pair_code_${acct.account_id}` });
-    } else {
-      row.push({ text: `⏹ Disconnect`, callback_data: `wa_disconnect_${acct.account_id}` });
-    }
-    row.push({ text: `🗑️ Remove`, callback_data: `wa_remove_${acct.account_id}` });
-    keyboard.push(row);
+    if (st !== 'connected') row.push({ text: `📷 QR`, callback_data: `wa_qr_${a.account_id}` });
+    if (st !== 'connected') row.push({ text: `🔗 Pair`, callback_data: `wa_pair_${a.account_id}` });
+    if (st === 'connected') row.push({ text: `⏹ Disconnect`, callback_data: `wa_dis_${a.account_id}` });
+    if (a.account_type === 'checker') row.push({ text: `→ Backup`, callback_data: `wa_type_bk_${a.account_id}` });
+    else row.push({ text: `→ Checker`, callback_data: `wa_type_ck_${a.account_id}` });
+    row.push({ text: `🗑`, callback_data: `wa_del_${a.account_id}` });
+    kb.push(row);
   }
 
-  keyboard.push([{ text: '➕ Add Account', callback_data: 'wa_add' }, { text: '🔄 Refresh', callback_data: 'wa_accounts' }]);
-  keyboard.push([{ text: '◀️ Back', callback_data: 'main_menu' }]);
+  kb.push([{ text: '➕ Add Account', callback_data: 'op_add_acct' }, { text: '🔄 Refresh', callback_data: 'op_accounts' }]);
+  kb.push([{ text: '‹ Back', callback_data: 'owner_panel' }]);
 
-  await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+  return editMsg(chatId, msgId, `📱 <b>WhatsApp Accounts</b>\n\n${body}`, { inline_keyboard: kb });
 }
 
-// ========== CALLBACK HANDLER ==========
-bot.on('callback_query', async (query) => {
-  const { message, from, data: cbData, id: queryId } = query;
-  const chatId = message.chat.id;
-  const userId = from.id;
-  const messageId = message.message_id;
+// ─── WA QR CONNECT ────────────────────────────────────────────────────────
+async function handleWaQR(chatId, userId, msgId, accountId) {
+  if (!isAdmin(userId)) return;
+  const statusMsg = await bot.sendMessage(chatId, `⏳ Generating QR code for <b>${esc(accountId)}</b>...`, { parse_mode: 'HTML' });
+  logEvent(userId, '', 'WA Connect (QR)', accountId);
 
-  const isMember = await checkForceSub(userId);
-  if (!isMember) {
-    const ch = db.getSetting('fsub_channel');
-    return bot.answerCallbackQuery(queryId, { text: `Join ${ch} first!`, show_alert: true });
-  }
+  connectAccount(accountId, db.getAccount(accountId)?.account_type || 'checker');
 
-  try {
-    // ===== Dynamic WA callbacks =====
-    if (cbData.startsWith('wa_connect_')) {
-      if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-      const accountId = cbData.replace('wa_connect_', '');
-      await bot.answerCallbackQuery(queryId, { text: '⏳ QR generate ho raha hai...' });
-
-      // Status message bhejo
-      const statusMsg = await bot.sendMessage(chatId, '⏳ WhatsApp se connect ho raha hai...\nQR code aa raha hai, thoda wait karo...');
-
-      // Connect start karo
-      connectAccount(accountId);
-
-      // QR ka wait karo — max 20 seconds
-      let qrSent = false;
-      for (let i = 0; i < 20; i++) {
-        await sleep(1000);
-        const acct = accounts.get(accountId);
-        if (acct?.status === 'connected') {
-          await bot.editMessageText(`✅ Account <b>${escapeHtml(accountId)}</b> connected ho gaya!`, {
-            chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML'
-          }).catch(() => {});
-          qrSent = true;
-          break;
-        }
-        if (acct?.qrCode) {
-          // QR image bhejo
-          const buffer = Buffer.from(acct.qrCode.split(',')[1], 'base64');
-          await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
-          await bot.sendPhoto(chatId, buffer, {
-            caption: `📱 <b>Account: ${escapeHtml(accountId)}</b>\n\nWhatsApp kholo → Settings → Linked Devices → Link a Device\nYeh QR scan karo\n\n⏳ QR 60 seconds mein expire hoga`,
-            parse_mode: 'HTML',
-            reply_markup: getBackButton()
-          });
-          qrSent = true;
-          break;
-        }
-      }
-
-      if (!qrSent) {
-        await bot.editMessageText(`❌ QR generate nahi hua. Dobara try karo.`, {
-          chat_id: chatId, message_id: statusMsg.message_id, reply_markup: getBackButton()
-        }).catch(() => {});
-      }
-
+  for (let i = 0; i < 20; i++) {
+    await sleep(1000);
+    const a = accounts.get(accountId);
+    if (a?.status === 'connected') {
+      await bot.editMessageText(`✅ <b>${esc(accountId)}</b> is already connected!`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML' });
+      return showWaAccounts(chatId, userId, msgId);
+    }
+    if (a?.qrCode) {
+      const buf = Buffer.from(a.qrCode.split(',')[1], 'base64');
+      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+      await bot.sendPhoto(chatId, buf, {
+        caption: `📱 <b>Scan QR — ${esc(accountId)}</b>\n\nWhatsApp → Settings → Linked Devices → Link a Device\n\n⏳ Expires in ~60 seconds`,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'op_accounts' }]] }
+      });
       return;
     }
-
-    if (cbData.startsWith('wa_disconnect_')) {
-      if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-      const accountId = cbData.replace('wa_disconnect_', '');
-      await disconnectAccount(accountId);
-      await bot.answerCallbackQuery(queryId, { text: '✅ Disconnected!' });
-      return handleWaAccounts(chatId, messageId);
-    }
-
-    if (cbData.startsWith('wa_remove_')) {
-      if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-      const accountId = cbData.replace('wa_remove_', '');
-      await disconnectAccount(accountId);
-      accounts.delete(accountId);
-      db.removeAccount(accountId);
-      await bot.answerCallbackQuery(queryId, { text: '✅ Removed!' });
-      return handleWaAccounts(chatId, messageId);
-    }
-
-    if (cbData.startsWith('wa_pair_code_')) {
-      if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-      const accountId = cbData.replace('wa_pair_code_', '');
-      userStates.set(userId, { mode: 'pair_wa_number', accountId });
-      await bot.editMessageText(`🔗 *Pairing — ${escapeHtml(accountId)}*\n\nApna WhatsApp number bhejo:\n\nFormat: \`919876543210\``, {
-        chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-      });
-      return bot.answerCallbackQuery(queryId);
-    }
-
-    // ===== Static callbacks =====
-    switch (cbData) {
-      case 'main_menu':
-        await bot.editMessageText(getWelcomeMessage(from.username || from.first_name, false), {
-          chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: getMainMenuKeyboard(userId)
-        });
-        userStates.delete(userId);
-        break;
-
-      case 'check_number':
-        userStates.set(userId, { mode: 'check_single' });
-        await bot.editMessageText(`📞 *Check Single Number*\n\nNumber bhejo:\n\nFormat: \`919876543210\` ya \`+919876543210\``, {
-          chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-        });
-        break;
-
-      case 'bulk_check':
-        userStates.set(userId, { mode: 'bulk_check' });
-        await bot.editMessageText(`📁 *Bulk Check*\n\n\`.txt\` file bhejo ya seedha numbers.\n\n📊 Limit: ${db.getSetting('batch_limit') || 100}`, {
-          chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-        });
-        break;
-
-      case 'get_number':    await handleGetNumber(chatId, userId, messageId); break;
-      case 'change_number': await handleChangeNumber(chatId, userId, messageId); break;
-
-      case 'upload_mode':
-        userStates.set(userId, { mode: 'upload' });
-        await bot.editMessageText(`📤 *Upload Mode*\n\nNumbers ya \`.txt\` file bhejo.\nPool mein save honge.`, {
-          chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-        });
-        break;
-
-      case 'status': await handleStatus(chatId, messageId); break;
-      case 'stats':  await handleStats(chatId, userId, messageId); break;
-
-      case 'users':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        await handleUsers(chatId, messageId);
-        break;
-
-      case 'toggle_bot':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        await handleToggleBot(chatId, messageId);
-        break;
-
-      case 'set_public':
-      case 'set_private':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        db.setSetting('bot_mode', cbData === 'set_public' ? 'public' : 'private');
-        await bot.answerCallbackQuery(queryId, { text: `✅ ${cbData === 'set_public' ? 'Public' : 'Private'} mode set!` });
-        await handleToggleBot(chatId, messageId);
-        break;
-
-      case 'wa_accounts':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        await handleWaAccounts(chatId, messageId);
-        break;
-
-      case 'wa_add':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        userStates.set(userId, { mode: 'wa_add' });
-        await bot.editMessageText(`➕ *Add WhatsApp Account*\n\nAccount ke liye naam bhejo.\nSirf lowercase letters, numbers, underscore.\n\nExample: \`account1\`, \`main\`, \`backup_wa\``, {
-          chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-        });
-        break;
-
-      case 'paid_mode':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        await handlePaidMode(chatId, messageId);
-        break;
-      case 'paid_on':
-      case 'paid_off':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        db.setSetting('paid_mode', cbData === 'paid_on' ? 'true' : 'false');
-        await bot.answerCallbackQuery(queryId, { text: `✅ Paid mode ${cbData === 'paid_on' ? 'enabled' : 'disabled'}!` });
-        await handlePaidMode(chatId, messageId);
-        break;
-
-      case 'force_sub':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        await handleForceSub(chatId, messageId);
-        break;
-      case 'fsub_remove':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        db.setSetting('fsub_channel', '');
-        await bot.answerCallbackQuery(queryId, { text: '✅ Removed!' });
-        await handleForceSub(chatId, messageId);
-        break;
-      case 'fsub_set':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        userStates.set(userId, { mode: 'set_fsub' });
-        await bot.editMessageText(`📢 *Force Subscribe*\n\nChannel username ya ID bhejo.\n\nFormat: \`@channelname\` ya \`-100xxxxxxxxxx\``, {
-          chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-        });
-        break;
-
-      case 'set_limit':
-        if (!isAuthorized(userId, 'admin')) return bot.answerCallbackQuery(queryId, { text: '❌ Admin only!', show_alert: true });
-        userStates.set(userId, { mode: 'set_limit' });
-        await bot.editMessageText(`⚙️ *Batch Limit*\n\nCurrent: \`${db.getSetting('batch_limit') || 100}\`\n\nNaya limit bhejo (1-1000):`, {
-          chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-        });
-        break;
-    }
-
-    bot.answerCallbackQuery(queryId);
-  } catch (err) {
-    logger.error('Callback error:', err);
-    bot.answerCallbackQuery(queryId, { text: '❌ Error!' });
   }
+  await bot.editMessageText(`❌ Failed to generate QR. Please try again.`, { chat_id: chatId, message_id: statusMsg.message_id, reply_markup: backBtn });
+}
+
+// ─── WA PAIRING PROMPT ────────────────────────────────────────────────────
+async function handleWaPairPrompt(chatId, userId, msgId, accountId) {
+  if (!isAdmin(userId)) return;
+  userStates.set(userId, { mode: 'pair_wa', accountId, accountType: db.getAccount(accountId)?.account_type || 'checker' });
+  return editMsg(chatId, msgId,
+    `🔗 <b>Pair via Phone — ${esc(accountId)}</b>\n\nSend your WhatsApp phone number:\n\nFormat: <code>919876543210</code> (with country code, no +)`,
+    backBtn);
+}
+
+// ─── WA DISCONNECT ────────────────────────────────────────────────────────
+async function handleWaDisconnect(chatId, userId, msgId, accountId) {
+  if (!isAdmin(userId)) return;
+  await disconnectAccount(accountId);
+  logEvent(userId, '', 'WA Disconnected', accountId);
+  return showWaAccounts(chatId, userId, msgId);
+}
+
+// ─── WA DELETE ────────────────────────────────────────────────────────────
+async function handleWaDelete(chatId, userId, msgId, accountId) {
+  if (!isAdmin(userId)) return;
+  await disconnectAccount(accountId);
+  accounts.delete(accountId);
+  db.removeAccount(accountId);
+  logEvent(userId, '', 'WA Account Removed', accountId);
+  return showWaAccounts(chatId, userId, msgId);
+}
+
+// ─── WA SET TYPE ──────────────────────────────────────────────────────────
+async function handleWaSetType(chatId, userId, msgId, accountId, type) {
+  if (!isAdmin(userId)) return;
+  db.setAccountType(accountId, type);
+  const s = accounts.get(accountId);
+  if (s) s.accountType = type;
+  return showWaAccounts(chatId, userId, msgId);
+}
+
+// ─── ADD ACCOUNT ──────────────────────────────────────────────────────────
+async function startAddAccount(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  userStates.set(userId, { mode: 'add_account' });
+  return editMsg(chatId, msgId,
+    `➕ <b>Add WhatsApp Account</b>\n\nSend a name for this account:\n\n• Lowercase letters, numbers, underscores only\n• Examples: <code>account1</code>, <code>main</code>, <code>backup_1</code>`,
+    backBtn);
+}
+
+// ─── USERS LIST ───────────────────────────────────────────────────────────
+async function showUsersList(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const users = db.getAllUsers().slice(0, 30);
+  const total = db.getAllUsers().length;
+  const kb    = users.map(u => {
+    const role = u.role === 'owner' ? '👑' : u.role === 'admin' ? '⭐' : db.isPremiumActive(u.telegram_id) ? '💎' : u.is_blocked ? '🚫' : '👤';
+    return [{ text: `${role} @${u.username||'unknown'} (${u.telegram_id})`, callback_data: `user_info_${u.telegram_id}` }];
+  });
+  kb.push([{ text: '‹ Back', callback_data: 'owner_panel' }]);
+  return editMsg(chatId, msgId,
+    `👥 <b>Users (${total})</b>\n\nShowing first 30. Use /user <id> for specific user.`,
+    { inline_keyboard: kb });
+}
+
+// ─── USER INFO ────────────────────────────────────────────────────────────
+async function handleUserInfo(chatId, adminId, msgId, targetId) {
+  if (!isAdmin(adminId)) return;
+  const u = db.getUser(targetId);
+  if (!u) return editMsg(chatId, msgId, `❌ User not found.`, backBtn);
+
+  const role    = u.role === 'owner' ? '👑 Owner' : u.role === 'admin' ? '⭐ Admin' : '👤 User';
+  const prem    = db.isPremiumActive(targetId);
+  const premTxt = prem ? (u.premium_until ? `until ${new Date(u.premium_until).toLocaleDateString()}` : 'Lifetime') : 'No';
+  const banned  = u.is_blocked ? '🚫 Yes' : '✅ No';
+
+  const kb = { inline_keyboard: [
+    u.is_blocked
+      ? [{ text: '✅ Unban', callback_data: `user_unban_${targetId}` }]
+      : [{ text: '🚫 Ban', callback_data: `user_ban_${targetId}` }],
+    u.role === 'admin'
+      ? [{ text: '⬇️ Demote', callback_data: `user_demote_${targetId}` }]
+      : [{ text: '⬆️ Promote to Admin', callback_data: `user_promote_${targetId}` }],
+    prem
+      ? [{ text: '❌ Remove Premium', callback_data: `user_remprem_${targetId}` }]
+      : [],
+    [{ text: '‹ Back', callback_data: 'op_users' }],
+  ].filter(r => r.length)};
+
+  return editMsg(chatId, msgId,
+    `👤 <b>User Info</b>\n\n` +
+    `🆔 ID: <code>${targetId}</code>\n` +
+    `👤 @${esc(u.username)||'N/A'} — ${esc(u.first_name||'')}\n` +
+    `🎭 Role: ${role}\n` +
+    `💎 Premium: ${premTxt}\n` +
+    `🚫 Banned: ${banned}\n` +
+    `📊 Checks: ${fmt(u.numbers_checked)}\n` +
+    `📅 Joined: ${new Date(u.joined_at).toLocaleDateString()}`,
+    kb);
+}
+
+async function handleUserBan(chatId, adminId, msgId, targetId, ban) {
+  if (!isAdmin(adminId)) return;
+  db.blockUser(targetId, ban);
+  logEvent(adminId, '', ban ? 'User Banned' : 'User Unbanned', String(targetId));
+  return handleUserInfo(chatId, adminId, msgId, targetId);
+}
+
+async function handleUserRole(chatId, adminId, msgId, targetId, role) {
+  if (!isOwner(adminId) && role === 'admin') return;
+  db.updateRole(targetId, role);
+  logEvent(adminId, '', `User ${role === 'admin' ? 'Promoted' : 'Demoted'}`, String(targetId));
+  return handleUserInfo(chatId, adminId, msgId, targetId);
+}
+
+async function handleRemovePremium(chatId, adminId, msgId, targetId) {
+  if (!isAdmin(adminId)) return;
+  db.removePremium(targetId);
+  logEvent(adminId, '', 'Premium Removed', String(targetId));
+  return handleUserInfo(chatId, adminId, msgId, targetId);
+}
+
+// ─── BROADCAST ────────────────────────────────────────────────────────────
+async function startBroadcast(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  userStates.set(userId, { mode: 'broadcast' });
+  return editMsg(chatId, msgId,
+    `📢 <b>Broadcast Message</b>\n\nSend the message you want to broadcast to all users.\n\nSupports: HTML formatting, photos, documents.`,
+    backBtn);
+}
+
+// ─── FORCE SUB SETTINGS ───────────────────────────────────────────────────
+async function showFsubSettings(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const ch = db.getSetting('fsub_channel') || 'Not set';
+  return editMsg(chatId, msgId,
+    `🔒 <b>Force Subscribe</b>\n\nCurrent channel: <code>${esc(ch)}</code>\n\nUsers must join this channel before using the bot.`,
+    { inline_keyboard: [
+      [{ text: '✏️ Set Channel', callback_data: 'set_fsub_input' }, { text: '❌ Remove', callback_data: 'fsub_remove' }],
+      [{ text: '‹ Back', callback_data: 'owner_panel' }],
+    ]});
+}
+
+// ─── BOT SETTINGS ─────────────────────────────────────────────────────────
+async function showBotSettings(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const mode   = db.getSetting('bot_mode')   || 'public';
+  const maint  = db.getSetting('maintenance')|| 'off';
+  const paid   = db.getSetting('paid_mode')  || 'false';
+  const freeL  = db.getSetting('free_limit') || '20';
+  const premL  = db.getSetting('prem_limit') || '500';
+  const bulkL  = db.getSetting('bulk_limit') || '100';
+  const refB   = db.getSetting('refer_bonus')|| '10';
+
+  return editMsg(chatId, msgId,
+    `⚙️ <b>Bot Settings</b>\n\n` +
+    `🌐 Mode: <b>${mode}</b>\n` +
+    `🔧 Maintenance: <b>${maint}</b>\n` +
+    `💰 Paid Mode: <b>${paid}</b>\n` +
+    `👤 Free daily limit: <b>${freeL}</b>\n` +
+    `💎 Premium daily limit: <b>${premL}</b>\n` +
+    `📁 Bulk limit: <b>${bulkL}</b>\n` +
+    `🔗 Refer bonus: <b>${refB} checks</b>`,
+    { inline_keyboard: [
+      [{ text: mode==='public'?'✅ Public':'⬜ Public', callback_data:'set_public' }, { text: mode==='private'?'✅ Private':'⬜ Private', callback_data:'set_private' }],
+      [{ text: maint==='on'?'✅ Maintenance ON':'⬜ Maintenance ON', callback_data:'maint_on' }, { text: maint==='off'?'✅ Maintenance OFF':'⬜ Maintenance OFF', callback_data:'maint_off' }],
+      [{ text: paid==='true'?'✅ Paid Mode ON':'⬜ Paid Mode ON', callback_data:'paid_on' }, { text: paid!=='true'?'✅ Paid Mode OFF':'⬜ Paid Mode OFF', callback_data:'paid_off' }],
+      [{ text: '👤 Free Limit', callback_data:'set_free_limit' }, { text: '💎 Premium Limit', callback_data:'set_prem_limit' }],
+      [{ text: '📁 Bulk Limit', callback_data:'set_bulk_limit' }, { text: '🔗 Refer Bonus', callback_data:'set_refer_bonus' }],
+      [{ text: '‹ Back', callback_data:'owner_panel' }],
+    ]});
+}
+
+// ─── DETAILED STATS ───────────────────────────────────────────────────────
+async function showDetailedStats(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const total  = db.getTotalStats();
+  const users  = db.getAllUsers();
+  const prems  = users.filter(u => db.isPremiumActive(u.telegram_id)).length;
+  const admins = users.filter(u => u.role === 'admin').length;
+  const hist   = db.getStatsHistory(7);
+  const waAll  = db.getAllAccounts();
+  let waStats  = '';
+  for (const a of waAll) waStats += `• ${esc(a.label)}: ${a.total_checks} checks, ${a.ban_count} bans\n`;
+
+  return editMsg(chatId, msgId,
+    `📊 <b>Detailed Statistics</b>\n\n` +
+    `👥 Users: <b>${users.length}</b> total | 💎 <b>${prems}</b> premium | ⭐ <b>${admins}</b> admin\n\n` +
+    `📱 Total checks: <b>${fmt(total?.total_checks)}</b>\n` +
+    `✅ Registered: <b>${fmt(total?.registered_count)}</b>\n` +
+    `❌ Not registered: <b>${fmt(total?.not_registered_count)}</b>\n\n` +
+    `📈 <b>Last 7 days:</b>\n${hist.map(d=>`• ${d.date}: ${d.total_checks} checks`).join('\n') || 'No data'}\n\n` +
+    `📱 <b>WA Accounts:</b>\n${waStats || 'None'}`,
+    { inline_keyboard: [[{ text: '‹ Back', callback_data: 'owner_panel' }]] });
+}
+
+// ─── LOG GROUP SETUP ──────────────────────────────────────────────────────
+async function setupLogGroup(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const current = config.LOG_GROUP_ID || db.getSetting('log_group_id') || 'Not set';
+  userStates.set(userId, { mode: 'set_log_group' });
+  return editMsg(chatId, msgId,
+    `📋 <b>Log Group Setup</b>\n\nCurrent: <code>${esc(current)}</code>\n\nAll bot events (joins, checks, errors) will be sent here.\nSend the group/channel ID:`,
+    backBtn);
+}
+
+// ─── GET / CHANGE NUMBER ─────────────────────────────────────────────────
+async function handleGetNumber(chatId, userId, msgId) {
+  const n = db.getNextNumber(userId);
+  if (!n) {
+    return editMsg(chatId, msgId,
+      `🎲 <b>Get Number</b>\n\n❌ Your pool is empty.\n\nUse <b>Upload Numbers</b> in Tools to add some.`,
+      { inline_keyboard: [[{ text: '📤 Upload Numbers', callback_data: 'tools_upload' }], [{ text: '‹ Back', callback_data: 'tools' }]] });
+  }
+  const rem = db.getNumberCount(userId);
+  return editMsg(chatId, msgId,
+    `🎲 <b>Your Number</b>\n\n📱 <code>${n.phone_number}</code>\n\n📦 Remaining in pool: ${rem}`,
+    { inline_keyboard: [
+      [{ text: '🔄 Skip / Next', callback_data: 'tools_change' }],
+      [{ text: '‹ Back to Tools', callback_data: 'tools' }],
+    ]});
+}
+
+async function handleChangeNumber(chatId, userId, msgId) {
+  const n = db.getNextNumber(userId);
+  if (!n) {
+    return editMsg(chatId, msgId,
+      `🔄 <b>Skip Number</b>\n\n❌ No more numbers in pool.`,
+      { inline_keyboard: [[{ text: '‹ Back', callback_data: 'tools' }]] });
+  }
+  const rem = db.getNumberCount(userId);
+  return editMsg(chatId, msgId,
+    `🎲 <b>Next Number</b>\n\n📱 <code>${n.phone_number}</code>\n\n📦 Remaining: ${rem}`,
+    { inline_keyboard: [
+      [{ text: '🔄 Skip / Next', callback_data: 'tools_change' }],
+      [{ text: '‹ Back to Tools', callback_data: 'tools' }],
+    ]});
+}
+
+// ─── PROFILE EXPORT ───────────────────────────────────────────────────────
+bot.on('callback_query', async q => {
+  if (q.data !== 'export_profile') return;
+  await bot.answerCallbackQuery(q.id);
+  const userId = q.from.id;
+  const u = db.getUser(userId);
+  if (!u) return;
+  const prem = db.isPremiumActive(userId);
+  const txt  =
+    `WhatsApp Checker Bot — User Profile Export\n` +
+    `==========================================\n` +
+    `Exported: ${new Date().toISOString()}\n\n` +
+    `ID:         ${u.telegram_id}\n` +
+    `Username:   @${u.username || 'N/A'}\n` +
+    `Name:       ${u.first_name || 'N/A'}\n` +
+    `Role:       ${u.role}\n` +
+    `Premium:    ${prem ? (u.premium_until ? `Yes (until ${u.premium_until})` : 'Yes (Lifetime)') : 'No'}\n` +
+    `Blocked:    ${u.is_blocked ? 'Yes' : 'No'}\n\n` +
+    `Total checks:  ${u.numbers_checked || 0}\n` +
+    `Bonus checks:  ${u.bonus_checks || 0}\n` +
+    `Refer code:    ${u.refer_code || 'N/A'}\n` +
+    `Referrals:     ${u.refer_count || 0}\n` +
+    `Joined:        ${u.joined_at}\n` +
+    `Last active:   ${u.last_active}\n`;
+  await bot.sendDocument(q.message.chat.id, Buffer.from(txt, 'utf-8'),
+    { caption: '📄 Your profile data' },
+    { filename: `profile_${userId}.txt`, contentType: 'text/plain' });
 });
 
-// ========== HANDLER FUNCTIONS ==========
-async function handleGetNumber(chatId, userId, messageId) {
-  const number = db.getNextNumber(userId);
-  if (!number) {
-    return bot.editMessageText(`🎲 *Get Number*\n\n❌ Pool empty hai.\nUpload se pehle numbers add karo.`, {
-      chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-    });
-  }
-  const remaining = db.getNumberCount(userId);
-  await bot.editMessageText(`🎲 *Your Number*\n\n📱 \`${number.phone_number}\`\n\n📊 Remaining: ${remaining}`, {
-    chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: [[{ text: '🔄 Change', callback_data: 'change_number' }], [{ text: '◀️ Back', callback_data: 'main_menu' }]] }
-  });
-}
 
-async function handleChangeNumber(chatId, userId, messageId) {
-  const number = db.getNextNumber(userId);
-  if (!number) {
-    return bot.editMessageText(`🔄 *Change Number*\n\n❌ Koi number nahi bacha.`, {
-      chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-    });
-  }
-  const remaining = db.getNumberCount(userId);
-  await bot.editMessageText(`🎲 *New Number*\n\n📱 \`${number.phone_number}\`\n\n📊 Remaining: ${remaining}`, {
-    chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: [[{ text: '🔄 Change', callback_data: 'change_number' }], [{ text: '◀️ Back', callback_data: 'main_menu' }]] }
-  });
-}
+// ════════════════════════════════════════════════════════════════════════════
+//  MESSAGE HANDLER
+// ════════════════════════════════════════════════════════════════════════════
 
-async function handleStatus(chatId, messageId) {
-  const all = db.getAllAccounts();
-  let text = `📊 <b>WhatsApp Status</b>\n\n`;
-  if (all.length === 0) {
-    text += `Koi account nahi.\nAdmin panel se account add karo.`;
-  } else {
-    for (const acct of all) {
-      const inMem = accounts.get(acct.account_id);
-      const status = inMem?.status || (acct.is_connected ? 'connected' : (acct.is_enabled ? 'disconnected' : 'banned'));
-      const emoji = { connected: '🟢', waiting_for_scan: '⏳', connecting: '🔄', banned: '🚫', disconnected: '🔴' }[status] || '🔴';
-      text += `${emoji} <b>${escapeHtml(acct.label || acct.account_id)}</b>\n`;
-      text += `   📞 ${acct.phone_number ? '+' + acct.phone_number : 'Not paired'} | <code>${status}</code>\n\n`;
-    }
-  }
-  const active = getConnectedAccounts();
-  text += `✅ Active: <b>${active.length}</b> account(s) ready for checking`;
-  await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: getBackButton() });
-}
+bot.on('message', async msg => {
+  const chatId    = msg.chat.id;
+  const userId    = msg.from.id;
+  const username  = msg.from.username || '';
+  const firstName = msg.from.first_name || '';
+  const text      = msg.text;
 
-async function handleStats(chatId, userId, messageId) {
-  const stats = db.getTotalStats();
-  const users = db.getAllUsers();
-  const userStats = db.getUserStats(userId);
-  const active = getConnectedAccounts();
-  const allAccounts = db.getAllAccounts();
-
-  let acctStats = '';
-  for (const acct of allAccounts) {
-    const st = accounts.get(acct.account_id)?.status || 'disconnected';
-    const emoji = st === 'connected' ? '🟢' : st === 'banned' ? '🚫' : '🔴';
-    acctStats += `${emoji} ${escapeHtml(acct.label || acct.account_id)}: ${acct.total_checks} checks\n`;
-  }
-
-  await bot.editMessageText(`📈 *Statistics*\n\n*Global:*\n👥 Users: ${users.length}\n📱 Checked: ${stats?.total_checks || 0}\n✅ Registered: ${stats?.registered_count || 0}\n❌ Not Registered: ${stats?.not_registered_count || 0}\n\n*WA Accounts (${active.length} active):*\n${acctStats}\n*Your Stats:*\n📱 Your Checks: ${userStats?.total_checks || 0}`, {
-    chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton()
-  });
-}
-
-async function handleUsers(chatId, messageId) {
-  const users = db.getAllUsers();
-  if (!users.length) return bot.editMessageText('No users yet.', { chat_id: chatId, message_id: messageId, reply_markup: getBackButton() });
-  let text = `👥 *Users (${users.length})*\n\n`;
-  users.slice(0, 20).forEach(u => {
-    const re = u.role === 'owner' ? '👑' : u.role === 'admin' ? '⭐' : '👤';
-    const be = u.is_blocked ? '🚫' : '';
-    text += `${re}${be} \`${u.telegram_id}\` - @${u.username || 'unknown'}\n`;
-  });
-  if (users.length > 20) text += `\n... and ${users.length - 20} more`;
-  text += `\n\n/block <id> | /unblock <id>\n/promote <id> | /demote <id>\n/access grant <id> <days>`;
-  await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBackButton() });
-}
-
-async function handleToggleBot(chatId, messageId) {
-  const mode = db.getSetting('bot_mode') || 'public';
-  await bot.editMessageText(`🔄 *Bot Mode*\n\nCurrent: *${mode.toUpperCase()}*\n\n• Public: Sab use kar sakte hain\n• Private: Sirf allowed users`, {
-    chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: [
-      [{ text: mode === 'public' ? '✅ Public' : '⬜ Public', callback_data: 'set_public' }, { text: mode === 'private' ? '✅ Private' : '⬜ Private', callback_data: 'set_private' }],
-      [{ text: '◀️ Back', callback_data: 'main_menu' }]
-    ]}
-  });
-}
-
-async function handlePaidMode(chatId, messageId) {
-  const isPaid = db.getSetting('paid_mode') === 'true';
-  await bot.editMessageText(`💎 *Paid Mode*\n\nStatus: *${isPaid ? 'ON' : 'OFF'}*\n\nON hone pe users ko subscription chahiye.\n\n/access grant <id> <days>`, {
-    chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: [
-      [{ text: isPaid ? '✅ ON' : '⬜ ON', callback_data: 'paid_on' }, { text: !isPaid ? '✅ OFF' : '⬜ OFF', callback_data: 'paid_off' }],
-      [{ text: '◀️ Back', callback_data: 'main_menu' }]
-    ]}
-  });
-}
-
-async function handleForceSub(chatId, messageId) {
-  const ch = db.getSetting('fsub_channel') || 'Not set';
-  await bot.editMessageText(`📢 *Force Subscribe*\n\nCurrent: \`${ch}\``, {
-    chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: [
-      [{ text: '➕ Set Channel', callback_data: 'fsub_set' }, { text: '❌ Remove', callback_data: 'fsub_remove' }],
-      [{ text: '◀️ Back', callback_data: 'main_menu' }]
-    ]}
-  });
-}
-
-// ========== TEXT MESSAGE HANDLER ==========
-bot.on('message', async (msg) => {
-  const { id: chatId } = msg.chat;
-  const { id: userId, username, first_name } = msg.from;
-  const text = msg.text;
+  // Ignore commands (handled by onText)
   if (!text || text.startsWith('/')) return;
 
-  ensureOwner(userId, username || first_name);
+  // Maintenance block
+  if (isMaintenanceMode() && !isAdmin(userId)) {
+    return bot.sendMessage(chatId, `🔧 <b>Maintenance Mode</b>\n\nBot is under maintenance. Please check back soon.`, { parse_mode: 'HTML' });
+  }
+
+  db.createUser(userId, username, firstName);
 
   const isMember = await checkForceSub(userId);
   if (!isMember) {
     const ch = db.getSetting('fsub_channel');
-    return bot.sendMessage(chatId, `❌ Join ${ch} first, then /start`);
+    return bot.sendMessage(chatId, `🔒 Please join our channel first:\n👉 ${esc(ch)}\n\nThen click /start.`, { parse_mode: 'HTML' });
   }
 
   if (!isAuthorized(userId)) {
     if (config.OWNER_ID) {
-      const u = escapeHtml(username || first_name || 'unknown');
-      bot.sendMessage(config.OWNER_ID, `⚠️ <b>Unauthorized</b>\n\nUser: @${u}\nID: <code>${userId}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+      broadcastAdmins(`⚠️ <b>Unauthorized Access Attempt</b>\n\n👤 @${esc(username)} (<code>${userId}</code>)\n\nThey tried to use the bot without access.`);
     }
-    return bot.sendMessage(chatId, '❌ Not authorized. Contact @Bhardwa_j');
+    return bot.sendMessage(chatId, `🔒 <b>Access Denied</b>\n\nYou don't have permission to use this bot.\n\nContact <a href="https://t.me/bhardwa_j">@Bhardwa_j</a> for access.`, { parse_mode: 'HTML', disable_web_page_preview: true });
   }
 
-  const userState = userStates.get(userId);
+  const state = userStates.get(userId);
 
-  // ===== wa_add: account naam =====
-  if (userState?.mode === 'wa_add') {
-    const accountId = text.trim().replace(/\s+/g, '_').toLowerCase();
-    if (!/^[a-z0-9_]+$/.test(accountId)) {
-      return bot.sendMessage(chatId, '❌ Sirf lowercase letters, numbers, underscore use karo. e.g. account1');
-    }
-    if (db.getAccount(accountId)) {
-      userStates.delete(userId);
-      return bot.sendMessage(chatId, `❌ <code>${escapeHtml(accountId)}</code> pehle se exist karta hai.`, { parse_mode: 'HTML' });
-    }
-    db.addAccount(accountId, accountId);
-    accounts.set(accountId, { status: 'disconnected', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: null });
+  // ── Admin states ──────────────────────────────────────────────────────
+
+  if (state?.mode === 'broadcast') {
     userStates.delete(userId);
-    return bot.sendMessage(chatId, `✅ Account <b>${escapeHtml(accountId)}</b> add ho gaya!\n\nKaise connect karna hai?`, {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [
-        [{ text: '📷 QR Code se', callback_data: `wa_connect_${accountId}` }],
-        [{ text: '🔗 Pairing Code se', callback_data: `wa_pair_code_${accountId}` }],
-        [{ text: '◀️ Back', callback_data: 'main_menu' }]
-      ]}
-    });
+    const users  = db.getAllUsers();
+    let sent = 0, failed = 0;
+    const statusMsg = await bot.sendMessage(chatId, `📢 Broadcasting to ${users.length} users...`);
+    for (const u of users) {
+      try {
+        await bot.sendMessage(u.telegram_id, text, { parse_mode: 'HTML' });
+        sent++;
+      } catch (_) { failed++; }
+      await sleep(50);
+    }
+    logEvent(userId, username, 'Broadcast', `Sent: ${sent}, Failed: ${failed}`);
+    return bot.editMessageText(`📢 <b>Broadcast Complete</b>\n\n✅ Sent: ${sent}\n❌ Failed: ${failed}`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML' });
   }
 
-  // ===== pair_wa_number: phone number =====
-  if (userState?.mode === 'pair_wa_number') {
-    const { accountId } = userState;
+  if (state?.mode === 'add_account') {
     userStates.delete(userId);
-    const statusMsg = await bot.sendMessage(chatId, '⏳ Pairing code generate ho raha hai...');
+    const id = text.trim().replace(/\s+/g,'_').toLowerCase();
+    if (!/^[a-z0-9_]+$/.test(id)) return bot.sendMessage(chatId, '❌ Invalid name. Use only lowercase letters, numbers, underscores.');
+    if (db.getAccount(id)) return bot.sendMessage(chatId, `❌ Account <code>${esc(id)}</code> already exists.`, { parse_mode: 'HTML' });
+    db.addAccount(id, id, 'checker');
+    accounts.set(id, { status: 'disconnected', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: null, accountType: 'checker' });
+    logEvent(userId, username, 'WA Account Added', id);
+    return bot.sendMessage(chatId,
+      `✅ Account <b>${esc(id)}</b> created!\n\nHow would you like to connect?`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '📷 QR Code', callback_data: `wa_qr_${id}` }],
+        [{ text: '🔗 Pairing Code', callback_data: `wa_pair_${id}` }],
+        [{ text: '‹ Back', callback_data: 'op_accounts' }],
+      ]}});
+  }
+
+  if (state?.mode === 'pair_wa') {
+    const { accountId, accountType } = state;
+    userStates.delete(userId);
+    const statusMsg = await bot.sendMessage(chatId, `⏳ Generating pairing code for <b>${esc(accountId)}</b>...`, { parse_mode: 'HTML' });
     try {
-      const code = await getPairingCode(accountId, text.trim());
-      bot.editMessageText(`🔗 *Pairing Code*\n\nAccount: \`${escapeHtml(accountId)}\`\n\nCode: \`${code}\`\n\nWhatsApp → Settings → Linked Devices → Link a Device → Link with phone number`, {
-        chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown', reply_markup: getBackButton()
-      });
+      const code = await getPairingCode(accountId, text.trim(), accountType);
+      return bot.editMessageText(
+        `🔗 <b>Pairing Code — ${esc(accountId)}</b>\n\n` +
+        `Code: <code>${code}</code>\n\n` +
+        `<b>Steps:</b>\n1. Open WhatsApp\n2. Settings → Linked Devices\n3. Link a Device\n4. Link with phone number\n5. Enter the code above\n\n` +
+        `✅ Bot will notify you when connected.`,
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'op_accounts' }]] } });
     } catch (err) {
-      bot.editMessageText(`❌ Error: ${escapeHtml(err.message)}`, {
-        chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML', reply_markup: getBackButton()
-      });
+      return bot.editMessageText(`❌ <b>Pairing Failed</b>\n\n${esc(err.message)}`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML', reply_markup: backBtn });
     }
-    return;
   }
 
-  if (userState?.mode === 'set_fsub') {
+  if (state?.mode === 'add_premium_uid') {
+    userStates.set(userId, { mode: 'add_premium_days', targetId: parseInt(text.trim()) });
+    const tid = parseInt(text.trim());
+    if (isNaN(tid)) {
+      userStates.delete(userId);
+      return bot.sendMessage(chatId, '❌ Invalid Telegram ID. Must be a number.');
+    }
+    return bot.sendMessage(chatId,
+      `💎 Adding premium to <code>${tid}</code>\n\nSend duration:\n• Number of days: <code>30</code>\n• Or lifetime: <code>lifetime</code>`,
+      { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'add_premium_days') {
+    const { targetId } = state;
+    userStates.delete(userId);
+    let until = null;
+    if (text.trim().toLowerCase() !== 'lifetime') {
+      const days = parseInt(text.trim());
+      if (isNaN(days) || days < 1) return bot.sendMessage(chatId, '❌ Invalid. Send a number of days or "lifetime".');
+      until = new Date();
+      until.setDate(until.getDate() + days);
+    }
+    db.createUser(targetId, '', '', 'user');
+    db.setPremium(targetId, until);
+    const expTxt = until ? `until ${until.toLocaleDateString()}` : 'Lifetime';
+    logEvent(userId, username, 'Premium Added', `User ${targetId} — ${expTxt}`);
+    bot.sendMessage(targetId,
+      `💎 <b>Premium Activated!</b>\n\n${until ? `Your premium is active until <b>${until.toLocaleDateString()}</b>.` : '✨ You have <b>Lifetime Premium</b>!'}\n\nEnjoy your benefits!`,
+      { parse_mode: 'HTML' }).catch(() => {});
+    return bot.sendMessage(chatId, `✅ Premium granted to <code>${targetId}</code> — ${expTxt}`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'set_fsub') {
+    userStates.delete(userId);
     db.setSetting('fsub_channel', text.trim());
+    return bot.sendMessage(chatId, `✅ Force subscribe channel set to: <code>${esc(text.trim())}</code>`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'set_free_limit') {
     userStates.delete(userId);
-    return bot.sendMessage(chatId, `✅ Force subscribe channel set: ${escapeHtml(text.trim())}`, { reply_markup: getBackButton() });
+    const v = parseInt(text);
+    if (isNaN(v) || v < 1) return bot.sendMessage(chatId, '❌ Invalid number.');
+    db.setSetting('free_limit', String(v));
+    return bot.sendMessage(chatId, `✅ Free daily limit set to <b>${v}</b>`, { parse_mode: 'HTML' });
   }
 
-  if (userState?.mode === 'set_limit') {
-    const limit = parseInt(text);
-    if (isNaN(limit) || limit < 1 || limit > 1000) return bot.sendMessage(chatId, '❌ Valid number dalo (1-1000)');
-    db.setSetting('batch_limit', limit.toString());
+  if (state?.mode === 'set_prem_limit') {
     userStates.delete(userId);
-    return bot.sendMessage(chatId, `✅ Batch limit: ${limit}`, { reply_markup: getBackButton() });
+    const v = parseInt(text);
+    if (isNaN(v) || v < 1) return bot.sendMessage(chatId, '❌ Invalid number.');
+    db.setSetting('prem_limit', String(v));
+    return bot.sendMessage(chatId, `✅ Premium daily limit set to <b>${v}</b>`, { parse_mode: 'HTML' });
   }
 
-  if (userState?.mode === 'upload') {
-    const numbers = text.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/[^\d]/g, '')));
-    if (!numbers.length) return bot.sendMessage(chatId, '❌ No valid numbers found');
-    for (const num of numbers) db.addNumber(userId, num.replace(/[^\d]/g, ''));
-    return bot.sendMessage(chatId, `✅ Added ${numbers.length} numbers to your pool!`, { reply_markup: getBackButton() });
+  if (state?.mode === 'set_bulk_limit') {
+    userStates.delete(userId);
+    const v = parseInt(text);
+    if (isNaN(v) || v < 1) return bot.sendMessage(chatId, '❌ Invalid number.');
+    db.setSetting('bulk_limit', String(v));
+    return bot.sendMessage(chatId, `✅ Bulk check limit set to <b>${v}</b>`, { parse_mode: 'HTML' });
   }
 
-  // ===== Default: check numbers =====
-  if (!hasAnyConnected()) {
-    return bot.sendMessage(chatId, '❌ Koi WhatsApp account connected nahi hai. Admin se contact karo.');
+  if (state?.mode === 'set_refer_bonus') {
+    userStates.delete(userId);
+    const v = parseInt(text);
+    if (isNaN(v) || v < 0) return bot.sendMessage(chatId, '❌ Invalid number.');
+    db.setSetting('refer_bonus', String(v));
+    return bot.sendMessage(chatId, `✅ Referral bonus set to <b>${v} checks</b>`, { parse_mode: 'HTML' });
   }
 
-  const numbers = text.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/[^\d]/g, '')));
-  if (!numbers.length) return;
+  if (state?.mode === 'set_log_group') {
+    userStates.delete(userId);
+    db.setSetting('log_group_id', text.trim());
+    return bot.sendMessage(chatId, `✅ Log group set to: <code>${esc(text.trim())}</code>`, { parse_mode: 'HTML' });
+  }
 
-  const batchLimit = parseInt(db.getSetting('batch_limit')) || 100;
-  if (numbers.length > batchLimit) return bot.sendMessage(chatId, `❌ Max ${batchLimit} numbers allowed`);
+  if (state?.mode === 'upload') {
+    const nums = text.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/\D/g,'')));
+    if (!nums.length) return bot.sendMessage(chatId, '❌ No valid numbers found.');
+    for (const n of nums) db.addNumber(userId, n.replace(/\D/g,''));
+    return bot.sendMessage(chatId, `✅ <b>${nums.length} numbers</b> added to your pool!`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '‹ Back to Tools', callback_data: 'tools' }]] }});
+  }
 
-  await processNumbers(chatId, userId, numbers);
+  // ── Default: check numbers ─────────────────────────────────────────────
+  if (!hasAnyChecker()) {
+    return bot.sendMessage(chatId,
+      `❌ <b>No WhatsApp accounts connected.</b>\n\nPlease contact the admin.`,
+      { parse_mode: 'HTML' });
+  }
+
+  // Paid mode check
+  const paidMode = db.getSetting('paid_mode') === 'true';
+  if (paidMode && !isPremium(userId) && !isAdmin(userId)) {
+    return bot.sendMessage(chatId,
+      `🔒 <b>Premium Required</b>\n\nNumber checking requires a premium subscription.\n\nUpgrade to continue:`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '💎 View Premium Plans', callback_data: 'premium_info' }]] }});
+  }
+
+  const nums = text.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/\D/g,'')));
+  if (!nums.length) return;
+
+  // Check daily limits
+  const freeLimit = parseInt(db.getSetting('free_limit') || '20');
+  const premLimit = parseInt(db.getSetting('prem_limit') || '500');
+  const bulk      = parseInt(db.getSetting('bulk_limit') || '100');
+  const limits    = db.getRemainingChecks(userId, freeLimit, premLimit);
+
+  if (limits.remaining <= 0) {
+    return bot.sendMessage(chatId,
+      `⏳ <b>Daily Limit Reached</b>\n\nYou've used all <b>${limits.limit}</b> daily checks.\n\n${limits.isPremium ? 'Resets at midnight.' : 'Upgrade to Premium for more checks:'}`,
+      { parse_mode: 'HTML', reply_markup: limits.isPremium ? undefined : { inline_keyboard: [[{ text: '💎 Upgrade to Premium', callback_data: 'premium_info' }]] }});
+  }
+
+  if (nums.length > bulk) {
+    return bot.sendMessage(chatId, `❌ Maximum <b>${bulk}</b> numbers per request.`, { parse_mode: 'HTML' });
+  }
+
+  const allowed = Math.min(nums.length, limits.remaining);
+  const toCheck = nums.slice(0, allowed);
+
+  logEvent(userId, username, 'Number Check', `${toCheck.length} numbers`);
+  await processNumbers(chatId, userId, toCheck);
 });
 
-// ========== DOCUMENT HANDLER ==========
-bot.on('document', async (msg) => {
-  const { id: chatId } = msg.chat;
-  const { id: userId, username, first_name } = msg.from;
+// ─── DOCUMENT HANDLER ─────────────────────────────────────────────────────
+bot.on('document', async msg => {
+  const chatId   = msg.chat.id;
+  const userId   = msg.from.id;
+  const username = msg.from.username || '';
 
-  ensureOwner(userId, username || first_name);
-  const isMember = await checkForceSub(userId);
-  if (!isMember) return bot.sendMessage(chatId, '❌ Join the channel first!');
-  if (!isAuthorized(userId)) return bot.sendMessage(chatId, '❌ Not authorized');
-  if (!msg.document.file_name.endsWith('.txt')) return bot.sendMessage(chatId, '❌ .txt file bhejo');
+  if (isMaintenanceMode() && !isAdmin(userId)) return;
 
+  db.createUser(userId, username, msg.from.first_name || '');
+  if (!isAuthorized(userId)) return bot.sendMessage(chatId, '🔒 Access denied.');
+  if (!msg.document.file_name.endsWith('.txt')) return bot.sendMessage(chatId, '❌ Please send a <code>.txt</code> file.', { parse_mode: 'HTML' });
+
+  const state = userStates.get(userId);
   try {
-    const file = await bot.getFile(msg.document.file_id);
+    const file    = await bot.getFile(msg.document.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    const response = await fetch(fileUrl);
-    const text = await response.text();
-    const numbers = text.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/[^\d]/g, '')));
+    const resp    = await fetch(fileUrl);
+    const txt     = await resp.text();
+    const nums    = txt.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/\D/g,'')));
 
-    if (!numbers.length) return bot.sendMessage(chatId, '❌ No valid numbers in file');
+    if (!nums.length) return bot.sendMessage(chatId, '❌ No valid numbers found in file.');
 
-    const userState = userStates.get(userId);
-    if (userState?.mode === 'upload') {
-      for (const num of numbers) db.addNumber(userId, num.replace(/[^\d]/g, ''));
-      return bot.sendMessage(chatId, `✅ Added ${numbers.length} numbers to pool!`, { reply_markup: getBackButton() });
+    if (state?.mode === 'upload') {
+      for (const n of nums) db.addNumber(userId, n.replace(/\D/g,''));
+      return bot.sendMessage(chatId, `✅ <b>${nums.length} numbers</b> added to your pool!`, { parse_mode: 'HTML' });
     }
 
-    if (!hasAnyConnected()) return bot.sendMessage(chatId, '❌ Koi account connected nahi');
-    const batchLimit = parseInt(db.getSetting('batch_limit')) || 100;
-    if (numbers.length > batchLimit) return bot.sendMessage(chatId, `❌ Max ${batchLimit}. File has ${numbers.length}`);
+    if (!hasAnyChecker()) return bot.sendMessage(chatId, '❌ No WhatsApp accounts connected.');
 
-    await processNumbers(chatId, userId, numbers, { alwaysSendTxt: true });
+    const paidMode = db.getSetting('paid_mode') === 'true';
+    if (paidMode && !isPremium(userId) && !isAdmin(userId)) {
+      return bot.sendMessage(chatId, `🔒 <b>Premium Required</b>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '💎 View Plans', callback_data: 'premium_info' }]] }});
+    }
+
+    const freeLimit = parseInt(db.getSetting('free_limit') || '20');
+    const premLimit = parseInt(db.getSetting('prem_limit') || '500');
+    const bulk      = parseInt(db.getSetting('bulk_limit') || '100');
+    const limits    = db.getRemainingChecks(userId, freeLimit, premLimit);
+
+    if (limits.remaining <= 0) return bot.sendMessage(chatId, `⏳ Daily limit reached.`);
+    if (nums.length > bulk)    return bot.sendMessage(chatId, `❌ File has ${nums.length} numbers. Max ${bulk} allowed.`);
+
+    const toCheck = nums.slice(0, limits.remaining);
+    logEvent(userId, username, 'Bulk File Check', `${toCheck.length} numbers`);
+    await processNumbers(chatId, userId, toCheck, { alwaysTxt: true });
   } catch (err) {
-    logger.error('File error:', err);
-    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+    bot.sendMessage(chatId, `❌ Error: ${esc(err.message)}`);
   }
 });
 
-// ========== PROCESS NUMBERS (Load Balanced) ==========
-async function processNumbers(chatId, userId, numbers, options = {}) {
-  const { alwaysSendTxt = false } = options;
-  const startedAt = Date.now();
-  const accountCount = getConnectedAccounts().length;
+// ─── PROCESS NUMBERS ──────────────────────────────────────────────────────
+async function processNumbers(chatId, userId, numbers, opts = {}) {
+  const { alwaysTxt = false } = opts;
+  const startedAt    = Date.now();
+  const checkerCount = getConnectedCheckers().length;
 
-  const statusMsg = await bot.sendMessage(chatId, formatProgress({ done: 0, total: numbers.length, startedAt, accountCount }), { parse_mode: 'HTML' });
+  const statusMsg = await bot.sendMessage(chatId,
+    buildProgressText(0, numbers.length, startedAt, checkerCount),
+    { parse_mode: 'HTML' });
 
-  let done = 0;
+  let done    = 0;
   let stopped = false;
-  const progressTimer = setInterval(() => {
+
+  const timer = setInterval(() => {
     if (stopped) return;
-    bot.editMessageText(formatProgress({ done, total: numbers.length, startedAt, accountCount: getConnectedAccounts().length }), {
-      chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML'
+    bot.editMessageText(buildProgressText(done, numbers.length, startedAt, getConnectedCheckers().length), {
+      chat_id:    chatId,
+      message_id: statusMsg.message_id,
+      parse_mode: 'HTML',
     }).catch(() => {});
   }, 3000);
 
-  const results = await checkNumbersBalanced(numbers, (d) => { done = d; });
+  const results = await bulkCheck(numbers, d => { done = d; });
 
   stopped = true;
-  clearInterval(progressTimer);
+  clearInterval(timer);
 
-  const registered = results.filter(r => r?.is_registered === true);
-  const notRegistered = results.filter(r => r?.is_registered === false);
-  const unknown = results.filter(r => r?.is_registered === null);
+  const reg   = results.filter(r => r?.is_registered === true);
+  const noReg = results.filter(r => r?.is_registered === false);
+  const unk   = results.filter(r => r?.is_registered === null);
 
-  db.incrementStats(registered.length, notRegistered.length);
-  db.incrementChecks(userId, numbers.length);
+  db.incrementStats(reg.length, noReg.length);
+  db.incrementDailyChecks(userId, numbers.length);
 
-  const activeNow = getConnectedAccounts().length;
-  const summaryLines = [
+  const lines = [
     `✅ <b>Results</b>`,
     ``,
-    `📊 Total: <code>${numbers.length}</code>`,
-    `✅ Registered: <code>${registered.length}</code>`,
-    `❌ Not Registered: <code>${notRegistered.length}</code>`,
-    `❓ Unknown: <code>${unknown.length}</code>`,
+    `📊 Total:          <code>${numbers.length}</code>`,
+    `✅ Registered:     <code>${reg.length}</code>`,
+    `❌ Not Registered: <code>${noReg.length}</code>`,
+    `❓ Unknown:        <code>${unk.length}</code>`,
   ];
-  if (accountCount > 1) summaryLines.push(`🔀 Used <b>${accountCount}</b> account(s) in parallel`);
+  if (checkerCount > 1) lines.push(`\n🔀 Processed via <b>${checkerCount}</b> accounts in parallel`);
 
-  const shouldSendTxt = alwaysSendTxt || numbers.length > 50;
-
-  if (shouldSendTxt) {
-    const sendFile = async (arr, filename, caption) => {
+  const sendTxt = alwaysTxt || numbers.length > 50;
+  if (sendTxt) {
+    const sendFile = async (arr, name, cap) => {
       if (!arr.length) return;
-      await bot.sendDocument(chatId, Buffer.from(arr.map(r => r.phone_number).join('\n'), 'utf-8'),
-        { caption }, { filename, contentType: 'text/plain; charset=utf-8' }
-      ).catch(() => {});
+      await bot.sendDocument(chatId, Buffer.from(arr.map(r=>r.phone_number).join('\n'), 'utf-8'),
+        { caption: cap }, { filename: name, contentType: 'text/plain; charset=utf-8' }).catch(() => {});
     };
-    await sendFile(registered, 'registered.txt', `✅ ${registered.length} registered`);
-    await sendFile(notRegistered, 'not_registered.txt', `❌ ${notRegistered.length} not registered`);
-    await sendFile(unknown, 'unknown.txt', `❓ ${unknown.length} unknown`);
-    summaryLines.push('', '📎 TXT files sent.');
+    await sendFile(reg,   'registered.txt',     `✅ ${reg.length} registered numbers`);
+    await sendFile(noReg, 'not_registered.txt',  `❌ ${noReg.length} not registered`);
+    await sendFile(unk,   'unknown.txt',          `❓ ${unk.length} unknown`);
+    lines.push('', '📎 Results sent as files.');
   } else {
-    const preview = (label, arr, icon) => {
+    const preview = (label, arr, ic) => {
       if (!arr.length) return;
-      summaryLines.push('', `<b>${label}:</b>`);
-      arr.slice(0, 30).forEach(r => summaryLines.push(`${icon} <code>${escapeHtml(r.phone_number)}</code>`));
-      if (arr.length > 30) summaryLines.push(`... +${arr.length - 30} more`);
+      lines.push('', `<b>${label}:</b>`);
+      arr.slice(0,30).forEach(r => lines.push(`${ic} <code>${esc(r.phone_number)}</code>`));
+      if (arr.length > 30) lines.push(`  … +${arr.length-30} more`);
     };
-    preview('Registered', registered, '✅');
-    preview('Not Registered', notRegistered, '❌');
-    preview('Unknown', unknown, '❓');
+    preview('Registered', reg, '✅');
+    preview('Not Registered', noReg, '❌');
+    preview('Unknown', unk, '❓');
   }
 
-  await bot.editMessageText(summaryLines.join('\n'), {
-    chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML', reply_markup: getBackButton()
+  await bot.editMessageText(lines.join('\n'), {
+    chat_id:    chatId,
+    message_id: statusMsg.message_id,
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '‹ Back to Menu', callback_data: 'main_menu' }]] },
   }).catch(async () => {
-    await bot.sendMessage(chatId, summaryLines.join('\n'), { parse_mode: 'HTML', reply_markup: getBackButton() }).catch(() => {});
+    await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '‹ Back to Menu', callback_data: 'main_menu' }]] }}).catch(() => {});
   });
 }
 
-// ========== ADMIN COMMANDS ==========
-bot.onText(/\/block (\d+)/, (msg, match) => {
-  if (!isAuthorized(msg.from.id, 'admin')) return bot.sendMessage(msg.chat.id, '❌ Admin only');
+function buildProgressText(done, total, startedAt, accts) {
+  const pct     = total === 0 ? 0 : Math.floor((done/total)*100);
+  const bar     = progressBar(done, total);
+  const elapsed = Date.now() - startedAt;
+  const rate    = done > 0 ? elapsed / done : null;
+  const eta     = rate ? Math.max(0, Math.round(rate * (total - done) / 1000)) : null;
+  const acctL   = accts > 1 ? `\n🔀 <b>${accts}</b> accounts in parallel` : '';
+  return `⏳ <b>Checking numbers...</b> ${done}/${total}\n<code>${bar}</code> ${pct}%${eta !== null ? `\n⏱ ETA: ~${eta}s` : ''}${acctL}`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ADMIN TEXT COMMANDS
+// ════════════════════════════════════════════════════════════════════════════
+
+bot.onText(/\/ban (\d+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
   db.blockUser(parseInt(match[1]), true);
-  bot.sendMessage(msg.chat.id, `✅ User ${match[1]} blocked`);
+  bot.sendMessage(msg.chat.id, `✅ User <code>${match[1]}</code> banned.`, { parse_mode: 'HTML' });
 });
-bot.onText(/\/unblock (\d+)/, (msg, match) => {
-  if (!isAuthorized(msg.from.id, 'admin')) return bot.sendMessage(msg.chat.id, '❌ Admin only');
+bot.onText(/\/unban (\d+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
   db.blockUser(parseInt(match[1]), false);
-  bot.sendMessage(msg.chat.id, `✅ User ${match[1]} unblocked`);
+  bot.sendMessage(msg.chat.id, `✅ User <code>${match[1]}</code> unbanned.`, { parse_mode: 'HTML' });
 });
 bot.onText(/\/promote (\d+)/, (msg, match) => {
-  if (msg.from.id !== config.OWNER_ID) return bot.sendMessage(msg.chat.id, '❌ Owner only');
-  db.updateUserRole(parseInt(match[1]), 'admin');
-  bot.sendMessage(msg.chat.id, `✅ User ${match[1]} promoted to admin`);
+  if (!isOwner(msg.from.id)) return;
+  db.updateRole(parseInt(match[1]), 'admin');
+  bot.sendMessage(msg.chat.id, `✅ User <code>${match[1]}</code> promoted to admin.`, { parse_mode: 'HTML' });
 });
 bot.onText(/\/demote (\d+)/, (msg, match) => {
-  if (msg.from.id !== config.OWNER_ID) return bot.sendMessage(msg.chat.id, '❌ Owner only');
-  db.updateUserRole(parseInt(match[1]), 'user');
-  bot.sendMessage(msg.chat.id, `✅ User ${match[1]} demoted`);
+  if (!isOwner(msg.from.id)) return;
+  db.updateRole(parseInt(match[1]), 'user');
+  bot.sendMessage(msg.chat.id, `✅ User <code>${match[1]}</code> demoted.`, { parse_mode: 'HTML' });
 });
-bot.onText(/\/access grant (\d+) (.+)/, (msg, match) => {
-  if (!isAuthorized(msg.from.id, 'admin')) return bot.sendMessage(msg.chat.id, '❌ Admin only');
+bot.onText(/\/addprem (\d+) (.+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
   const targetId = parseInt(match[1]);
-  const duration = match[2].trim();
-  let expiresAt = null;
-  if (duration !== 'lifetime') {
-    const days = parseInt(duration);
-    if (isNaN(days)) return bot.sendMessage(msg.chat.id, '❌ Days ya "lifetime" dalo');
-    expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + days);
+  const dur      = match[2].trim();
+  let until      = null;
+  if (dur !== 'lifetime') {
+    const days = parseInt(dur);
+    if (isNaN(days)) return bot.sendMessage(msg.chat.id, '❌ Use: /addprem <id> <days> or /addprem <id> lifetime');
+    until = new Date();
+    until.setDate(until.getDate() + days);
   }
-  db.grantAccess(targetId, expiresAt);
-  const accessMsg = expiresAt ? `Access until ${expiresAt.toLocaleDateString()}` : 'Lifetime access';
-  bot.sendMessage(msg.chat.id, `✅ User ${targetId}: ${accessMsg}`);
-  bot.sendMessage(targetId, `🎉 *Access Granted!*\n\n${expiresAt ? `Expires: ${expiresAt.toLocaleDateString()}` : '✨ Lifetime!'}\n\nClick /start`, { parse_mode: 'Markdown' }).catch(() => {});
+  db.createUser(targetId, '', '', 'user');
+  db.setPremium(targetId, until);
+  bot.sendMessage(msg.chat.id, `✅ Premium granted to <code>${targetId}</code> — ${until ? until.toLocaleDateString() : 'Lifetime'}`, { parse_mode: 'HTML' });
+  bot.sendMessage(targetId, `💎 <b>Premium Activated!</b>\n\n${until ? `Active until ${until.toLocaleDateString()}` : '✨ Lifetime Premium'}\n\nUse /start to continue.`, { parse_mode: 'HTML' }).catch(() => {});
+});
+bot.onText(/\/remprem (\d+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  db.removePremium(parseInt(match[1]));
+  bot.sendMessage(msg.chat.id, `✅ Premium removed from <code>${match[1]}</code>`, { parse_mode: 'HTML' });
+});
+bot.onText(/\/user (\d+)/, async (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const u = db.getUser(parseInt(match[1]));
+  if (!u) return bot.sendMessage(msg.chat.id, '❌ User not found.');
+  const prem = db.isPremiumActive(u.telegram_id);
+  bot.sendMessage(msg.chat.id,
+    `👤 <b>User Info</b>\n\n🆔 <code>${u.telegram_id}</code>\n@${esc(u.username)||'N/A'}\nRole: ${u.role}\nPremium: ${prem ? 'Yes' : 'No'}\nBlocked: ${u.is_blocked ? 'Yes' : 'No'}\nChecks: ${u.numbers_checked}`,
+    { parse_mode: 'HTML' });
 });
 
-// ========== EXPRESS SERVER ==========
-app.get('/', (_, res) => res.json({ status: 'running', bot: 'WhatsApp Checker Multi-Account' }));
+// ════════════════════════════════════════════════════════════════════════════
+//  EXPRESS SERVER
+// ════════════════════════════════════════════════════════════════════════════
+
+app.get('/',       (_, res) => res.json({ status: 'running', name: 'WA Number Checker Bot' }));
 app.get('/health', (_, res) => {
-  const active = getConnectedAccounts();
   res.json({
-    status: 'ok',
-    connected_accounts: active.length,
-    accounts: db.getAllAccounts().map(a => ({
-      id: a.account_id, label: a.label, connected: !!a.is_connected, phone: a.phone_number, checks: a.total_checks
-    }))
+    status:   'ok',
+    checkers: getConnectedCheckers().length,
+    accounts: db.getAllAccounts().map(a => ({ id: a.account_id, connected: !!a.is_connected, type: a.account_type })),
   });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+//  BOOT
+// ════════════════════════════════════════════════════════════════════════════
+
 const PORT = config.PORT || 3000;
 app.listen(PORT, async () => {
-  logger.info(`Server on port ${PORT}`);
-  await connectAllSavedAccounts();
+  console.log(`✅ Server running on port ${PORT}`);
+  await connectAllSaved();
+  console.log('✅ WhatsApp Number Checker Bot started!');
 });
-
-logger.info('Multi-account WhatsApp Bot started!');
