@@ -22,7 +22,7 @@ const db     = require('./database');
 let config;
 try { config = require('./config'); } catch (_) { config = require('./config.example'); }
 
-const logger = pino({ level: 'silent' }); // set 'info' for debug
+const logger = pino({ level: 'silent' });
 const app    = express();
 app.use(express.json());
 
@@ -189,11 +189,19 @@ async function connectAccount(accountId, accountType = 'checker') {
 
         if (isBanned) {
           db.incrementBanCount(accountId);
-          sendLog(`🚫 <b>Account Banned</b>\n\nID: <code>${esc(accountId)}</code>\n\nAuto-disabled. Promoting backup account...`);
+          const msg = `🚫 <b>Account Banned</b>\n\nID: <code>${esc(accountId)}</code>\n\nAuto-disabled. Promoting backup account...`;
+          sendLog(msg);
+          broadcastOwner(msg);
           await wipeSession(accountId);
-          // Promote a backup account automatically
           await promoteBackupAccount();
           return;
+        }
+
+        // ✅ FIX: Auto-reconnect on disconnect — promotes backup if no checkers left
+        if (type === 'checker' && getConnectedCheckers().length === 0) {
+          sendLog(`⚠️ <b>Checker Disconnected</b>\n\nID: <code>${esc(accountId)}</code>\nNo checkers left — promoting backup...`);
+          broadcastOwner(`⚠️ <b>Checker Disconnected</b>\n\nID: <code>${esc(accountId)}</code>\nNo checkers left — promoting backup...`);
+          await promoteBackupAccount();
         }
 
         if (acct.retryCount < MAX_RETRY) {
@@ -210,7 +218,9 @@ async function connectAccount(accountId, accountType = 'checker') {
         acct.phoneNumber = sock.user?.id?.split(':')[0] || null;
         db.setAccountConnected(accountId, true, acct.phoneNumber);
         await saveSession(accountId);
-        sendLog(`✅ <b>Account Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>${acct.phoneNumber}</code>\nType: <code>${type}</code>`);
+        const msg = `✅ <b>Account Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>+${acct.phoneNumber}</code>\nType: <code>${type}</code>`;
+        sendLog(msg);
+        broadcastOwner(msg);
       }
     });
 
@@ -228,7 +238,9 @@ async function promoteBackupAccount() {
     if (s?.status === 'connected') {
       db.setAccountType(b.account_id, 'checker');
       if (s) s.accountType = 'checker';
-      sendLog(`🔄 <b>Backup Promoted</b>\n\n<code>${esc(b.account_id)}</code> is now a checker account.`);
+      const msg = `🔄 <b>Backup Promoted</b>\n\n<code>${esc(b.account_id)}</code> is now a checker account.`;
+      sendLog(msg);
+      broadcastOwner(msg);
       return;
     }
   }
@@ -238,14 +250,19 @@ async function promoteBackupAccount() {
     if (!s || s.status !== 'connected') {
       db.setAccountType(b.account_id, 'checker');
       await connectAccount(b.account_id, 'checker');
-      sendLog(`🔄 <b>Backup Promoted & Connecting</b>\n\n<code>${esc(b.account_id)}</code>`);
+      const msg = `🔄 <b>Backup Promoted & Connecting</b>\n\n<code>${esc(b.account_id)}</code>`;
+      sendLog(msg);
+      broadcastOwner(msg);
       return;
     }
   }
-  sendLog(`⚠️ <b>No backup accounts available!</b>\n\nPlease add a new WhatsApp account.`);
+  const msg = `⚠️ <b>No backup accounts available!</b>\n\nPlease add a new WhatsApp account.`;
+  sendLog(msg);
+  broadcastOwner(msg);
 }
 
 // ─── CONNECT ALL SAVED ON BOOT ─────────────────────────────────────────────
+// ✅ FIX: On restart — always try to reconnect all enabled accounts using saved sessions
 async function connectAllSaved() {
   const saved = db.getAllAccounts();
   if (!saved.length) return;
@@ -254,13 +271,8 @@ async function connectAllSaved() {
       accounts.set(a.account_id, { status: 'banned', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: a.phone_number, accountType: a.account_type });
       continue;
     }
-    const dir = getSessionDir(a.account_id);
-    const hasLocal = fs.existsSync(dir) && fs.readdirSync(dir).length > 0;
-    if (hasLocal || supabase) {
-      await connectAccount(a.account_id, a.account_type || 'checker');
-    } else {
-      accounts.set(a.account_id, { status: 'disconnected', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: a.phone_number, accountType: a.account_type });
-    }
+    // ✅ Always attempt reconnect — loadSession will pull from Supabase if no local files
+    await connectAccount(a.account_id, a.account_type || 'checker');
   }
 }
 
@@ -271,6 +283,9 @@ async function disconnectAccount(accountId) {
   if (a?.sock) { try { await a.sock.logout(); } catch (_) {} a.sock = null; }
   if (a) a.status = 'disconnected';
   await wipeSession(accountId);
+  const msg = `🔌 <b>Account Disconnected</b>\n\nID: <code>${esc(accountId)}</code>`;
+  sendLog(msg);
+  broadcastOwner(msg);
 }
 
 // ─── CHECK ONE NUMBER ─────────────────────────────────────────────────────
@@ -373,18 +388,21 @@ async function getPairingCode(accountId, phone, accountType = 'checker') {
       a.phoneNumber = sock.user?.id?.split(':')[0] || null;
       db.setAccountConnected(accountId, true, a.phoneNumber);
       await saveSession(accountId);
-      sendLog(`✅ <b>Paired & Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>${a.phoneNumber}</code>`);
-      broadcastAdmins(`✅ <b>Account Connected via Pairing</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>${a.phoneNumber}</code>`);
+      const msg = `✅ <b>Account Paired & Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>+${a.phoneNumber}</code>\nType: <code>${accountType}</code>`;
+      sendLog(msg);
+      broadcastOwner(msg);
     }
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
         db.incrementBanCount(accountId);
         if (a) a.status = 'banned';
+        const msg = `🚫 <b>Account Banned (Pairing)</b>\n\nID: <code>${esc(accountId)}</code>`;
+        sendLog(msg);
+        broadcastOwner(msg);
       } else if (a) {
         a.status = 'disconnected';
         a.sock   = null;
-        // Auto-reconnect after pairing is done
         if (a.retryCount < MAX_RETRY) {
           a.retryCount++;
           const backoff = Math.min(30_000, 2_000 * a.retryCount);
@@ -394,7 +412,6 @@ async function getPairingCode(accountId, phone, accountType = 'checker') {
     }
   });
 
-  // Wait for socket to be ready before requesting code
   await sleep(3000);
   const formatted = phone.replace(/\D/g, '');
   const code      = await sock.requestPairingCode(formatted);
@@ -426,12 +443,13 @@ bot.on('polling_error', async err => {
 process.on('SIGTERM', async () => { try { await bot.stopPolling({ cancel: true }); } catch (_) {} process.exit(0); });
 process.on('SIGINT',  async () => { try { await bot.stopPolling({ cancel: true }); } catch (_) {} process.exit(0); });
 
-const userStates = new Map(); // userId → { mode, ... }
+// ✅ FIX: userId → { mode, ... } — also store msgId to know which button was pressed
+const userStates = new Map();
 
 // ─── LOG GROUP ────────────────────────────────────────────────────────────
 function sendLog(text) {
   const logGroup = config.LOG_GROUP_ID || db.getSetting('log_group_id');
-  if (!logGroup) return;
+  if (!logGroup || logGroup === '0' || logGroup === 0) return;
   bot.sendMessage(logGroup, text, { parse_mode: 'HTML' }).catch(() => {});
 }
 
@@ -440,7 +458,14 @@ function logEvent(userId, username, action, detail = '') {
   sendLog(`📋 <b>${esc(action)}</b>\n👤 @${u} (<code>${userId}</code>)\n${detail ? `ℹ️ ${esc(detail)}` : ''}`);
 }
 
-// ─── BROADCAST ────────────────────────────────────────────────────────────
+// ─── OWNER BROADCAST ─────────────────────────────────────────────────────
+// ✅ FIX: Send to owner only (not all admins) for account events
+function broadcastOwner(text) {
+  if (config.OWNER_ID && config.OWNER_ID !== 0) {
+    bot.sendMessage(config.OWNER_ID, text, { parse_mode: 'HTML' }).catch(() => {});
+  }
+}
+
 function broadcastAdmins(text) {
   const admins = db.getAdmins();
   const ids    = new Set([...admins.map(u => u.telegram_id)]);
@@ -515,7 +540,6 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const firstName= msg.from.first_name || '';
   const refCode  = match?.[1]?.trim();
 
-  // Maintenance check (except admins)
   if (isMaintenanceMode() && !isAdmin(userId)) {
     return bot.sendMessage(chatId,
       `🔧 <b>Maintenance Mode</b>\n\nThe bot is currently under maintenance. Please check back later.`,
@@ -524,7 +548,6 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
   const isNew = db.createUser(userId, username, firstName);
 
-  // Apply referral if new user and ref code given
   if (isNew && refCode) {
     const referrer = db.getUserByReferCode(refCode);
     if (referrer && referrer.telegram_id !== userId) {
@@ -545,15 +568,18 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   if (!isMember) {
     const ch = db.getSetting('fsub_channel');
     return bot.sendMessage(chatId,
-      `🔒 <b>Access Required</b>\n\nPlease join our channel to use this bot:\n👉 ${esc(ch)}\n\nAfter joining, click /start again.`,
-      { parse_mode: 'HTML' });
+      `🔒 <b>Access Required</b>\n\nTo use this bot, you must join our channel first.\n\n👉 <a href="${esc(ch)}">${esc(ch)}</a>\n\nAfter joining, click /start again.`,
+      { parse_mode: 'HTML', disable_web_page_preview: false });
   }
 
   logEvent(userId, username, '/start');
+  // ✅ FIX: Clear any stale state on /start
+  userStates.delete(userId);
   bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
 });
 
 // ─── FORCE SUBSCRIBE CHECK ─────────────────────────────────────────────────
+// ✅ FIX: Fetch channel info — name + invite link automatically
 async function checkForceSub(userId) {
   if (isAdmin(userId)) return true;
   const ch = db.getSetting('fsub_channel');
@@ -562,6 +588,29 @@ async function checkForceSub(userId) {
     const m = await bot.getChatMember(ch, userId);
     return ['member','administrator','creator'].includes(m.status);
   } catch (_) { return true; }
+}
+
+// ✅ FIX: Get channel display name and invite link automatically
+async function getFsubChannelInfo() {
+  const ch = db.getSetting('fsub_channel');
+  if (!ch) return null;
+  try {
+    const chat = await bot.getChat(ch);
+    let inviteLink = chat.invite_link || null;
+    // If no invite link stored, try to create/fetch one
+    if (!inviteLink) {
+      try { inviteLink = await bot.exportChatInviteLink(ch); } catch (_) {}
+    }
+    return {
+      id: ch,
+      title: chat.title || chat.username || ch,
+      username: chat.username ? `@${chat.username}` : null,
+      inviteLink,
+      link: chat.username ? `https://t.me/${chat.username}` : inviteLink,
+    };
+  } catch (_) {
+    return { id: ch, title: ch, username: null, inviteLink: null, link: ch };
+  }
 }
 
 // ─── CALLBACK ROUTER ──────────────────────────────────────────────────────
@@ -582,8 +631,9 @@ bot.on('callback_query', async query => {
 
   const isMember = await checkForceSub(userId);
   if (!isMember) {
-    const ch = db.getSetting('fsub_channel');
-    return bot.answerCallbackQuery(query.id, { text: `Please join ${ch} first!`, show_alert: true });
+    const info = await getFsubChannelInfo();
+    const linkText = info?.link || info?.id || '';
+    return bot.answerCallbackQuery(query.id, { text: `Please join our channel first!`, show_alert: true }).catch(() => {});
   }
 
   // ── Dynamic callbacks ──
@@ -602,6 +652,7 @@ bot.on('callback_query', async query => {
 
   switch (data) {
     case 'main_menu':    return showMainMenu(chatId, userId, msgId);
+    // ✅ FIX: Check Number & Bulk Check buttons now set state AND show instructions
     case 'check_number': return showCheckNumber(chatId, userId, msgId);
     case 'bulk_check':   return showBulkCheck(chatId, userId, msgId);
     case 'tools':        return showTools(chatId, userId, msgId);
@@ -611,6 +662,7 @@ bot.on('callback_query', async query => {
     case 'status':       return showStatus(chatId, userId, msgId);
     case 'help':         return showHelp(chatId, userId, msgId);
     case 'owner_panel':  return showOwnerPanel(chatId, userId, msgId);
+    case 'export_profile': return handleExportProfile(chatId, userId);
 
     // Owner panel sub-menus
     case 'op_accounts':  return showWaAccounts(chatId, userId, msgId);
@@ -650,7 +702,7 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'set_fsub' });
       return editMsg(chatId, msgId,
-        `📢 <b>Set Force Subscribe Channel</b>\n\nSend the channel username or ID:\n\n• Username: <code>@yourchannel</code>\n• ID: <code>-100xxxxxxxxxx</code>`,
+        `📢 <b>Set Force Subscribe Channel</b>\n\nSend the channel username or ID:\n\n• Username: <code>@yourchannel</code>\n• ID: <code>-100xxxxxxxxxx</code>\n\nBot will automatically fetch the channel name and invite link.`,
         backBtn);
 
     case 'set_free_limit':
@@ -704,6 +756,7 @@ async function editMsg(chatId, msgId, text, markup) {
     message_id: msgId,
     parse_mode: 'HTML',
     reply_markup: markup,
+    disable_web_page_preview: true,
   }).catch(() => {});
 }
 
@@ -713,7 +766,9 @@ async function showMainMenu(chatId, userId, msgId) {
 }
 
 // ─── CHECK NUMBER ─────────────────────────────────────────────────────────
+// ✅ FIX: Sets mode to 'check_single' so only then numbers are processed
 async function showCheckNumber(chatId, userId, msgId) {
+  if (!isAuthorized(userId)) return;
   userStates.set(userId, { mode: 'check_single' });
   return editMsg(chatId, msgId,
     `🔍 <b>Check Single Number</b>\n\nSend a phone number to verify:\n\n• With country code: <code>919876543210</code>\n• Or with +: <code>+919876543210</code>`,
@@ -721,7 +776,9 @@ async function showCheckNumber(chatId, userId, msgId) {
 }
 
 // ─── BULK CHECK ───────────────────────────────────────────────────────────
+// ✅ FIX: Sets mode to 'bulk_check' so only then bulk is processed
 async function showBulkCheck(chatId, userId, msgId) {
+  if (!isAuthorized(userId)) return;
   const freeLimit  = parseInt(db.getSetting('free_limit')  || '20');
   const premLimit  = parseInt(db.getSetting('prem_limit')  || '500');
   const bulkLimit  = parseInt(db.getSetting('bulk_limit')  || '100');
@@ -866,8 +923,8 @@ async function showStatus(chatId, userId, msgId) {
 async function showHelp(chatId, userId, msgId) {
   return editMsg(chatId, msgId,
     `❓ <b>How to Use</b>\n\n` +
-    `<b>🔍 Check Number</b>\nSend any phone number with country code to verify if it's on WhatsApp.\n\n` +
-    `<b>📁 Bulk Check</b>\nSend multiple numbers (one per line) or upload a <code>.txt</code> file. Results sent as files for large batches.\n\n` +
+    `<b>🔍 Check Number</b>\nTap the button, then send any phone number with country code.\n\n` +
+    `<b>📁 Bulk Check</b>\nTap the button, then send multiple numbers (one per line) or upload a <code>.txt</code> file.\n\n` +
     `<b>🛠 Tools</b>\nUpload a pool of numbers and retrieve them one by one.\n\n` +
     `<b>💎 Premium</b>\nGet higher daily limits and faster processing.\n\n` +
     `<b>🔗 Referral</b>\nShare your link — earn bonus checks for every friend who joins.\n\n` +
@@ -987,6 +1044,9 @@ async function handleWaDelete(chatId, userId, msgId, accountId) {
   accounts.delete(accountId);
   db.removeAccount(accountId);
   logEvent(userId, '', 'WA Account Removed', accountId);
+  const msg = `🗑 <b>Account Deleted</b>\n\nID: <code>${esc(accountId)}</code>`;
+  sendLog(msg);
+  broadcastOwner(msg);
   return showWaAccounts(chatId, userId, msgId);
 }
 
@@ -996,6 +1056,9 @@ async function handleWaSetType(chatId, userId, msgId, accountId, type) {
   db.setAccountType(accountId, type);
   const s = accounts.get(accountId);
   if (s) s.accountType = type;
+  const msg = `🔄 <b>Account Type Changed</b>\n\nID: <code>${esc(accountId)}</code>\nNew Type: <code>${type}</code>`;
+  sendLog(msg);
+  broadcastOwner(msg);
   return showWaAccounts(chatId, userId, msgId);
 }
 
@@ -1090,11 +1153,28 @@ async function startBroadcast(chatId, userId, msgId) {
 }
 
 // ─── FORCE SUB SETTINGS ───────────────────────────────────────────────────
+// ✅ FIX: Shows channel name and invite link automatically
 async function showFsubSettings(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
-  const ch = db.getSetting('fsub_channel') || 'Not set';
-  return editMsg(chatId, msgId,
-    `🔒 <b>Force Subscribe</b>\n\nCurrent channel: <code>${esc(ch)}</code>\n\nUsers must join this channel before using the bot.`,
+  const ch = db.getSetting('fsub_channel');
+  let body = `🔒 <b>Force Subscribe</b>\n\n`;
+
+  if (ch) {
+    const info = await getFsubChannelInfo();
+    if (info) {
+      body += `📢 Channel: <b>${esc(info.title)}</b>\n`;
+      if (info.username) body += `🔗 Username: ${esc(info.username)}\n`;
+      if (info.link) body += `📎 Link: ${esc(info.link)}\n`;
+      body += `🆔 ID: <code>${esc(ch)}</code>\n\n`;
+    } else {
+      body += `Current: <code>${esc(ch)}</code>\n\n`;
+    }
+    body += `Users must join this channel before using the bot.`;
+  } else {
+    body += `No channel set.\n\nUsers can use the bot freely without joining any channel.`;
+  }
+
+  return editMsg(chatId, msgId, body,
     { inline_keyboard: [
       [{ text: '✏️ Set Channel', callback_data: 'set_fsub_input' }, { text: '❌ Remove', callback_data: 'fsub_remove' }],
       [{ text: '‹ Back', callback_data: 'owner_panel' }],
@@ -1198,10 +1278,7 @@ async function handleChangeNumber(chatId, userId, msgId) {
 }
 
 // ─── PROFILE EXPORT ───────────────────────────────────────────────────────
-bot.on('callback_query', async q => {
-  if (q.data !== 'export_profile') return;
-  await bot.answerCallbackQuery(q.id);
-  const userId = q.from.id;
+async function handleExportProfile(chatId, userId) {
   const u = db.getUser(userId);
   if (!u) return;
   const prem = db.isPremiumActive(userId);
@@ -1221,11 +1298,10 @@ bot.on('callback_query', async q => {
     `Referrals:     ${u.refer_count || 0}\n` +
     `Joined:        ${u.joined_at}\n` +
     `Last active:   ${u.last_active}\n`;
-  await bot.sendDocument(q.message.chat.id, Buffer.from(txt, 'utf-8'),
+  await bot.sendDocument(chatId, Buffer.from(txt, 'utf-8'),
     { caption: '📄 Your profile data' },
     { filename: `profile_${userId}.txt`, contentType: 'text/plain' });
-});
-
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 //  MESSAGE HANDLER
@@ -1241,7 +1317,6 @@ bot.on('message', async msg => {
   // Ignore commands (handled by onText)
   if (!text || text.startsWith('/')) return;
 
-  // Maintenance block
   if (isMaintenanceMode() && !isAdmin(userId)) {
     return bot.sendMessage(chatId, `🔧 <b>Maintenance Mode</b>\n\nBot is under maintenance. Please check back soon.`, { parse_mode: 'HTML' });
   }
@@ -1250,8 +1325,12 @@ bot.on('message', async msg => {
 
   const isMember = await checkForceSub(userId);
   if (!isMember) {
-    const ch = db.getSetting('fsub_channel');
-    return bot.sendMessage(chatId, `🔒 Please join our channel first:\n👉 ${esc(ch)}\n\nThen click /start.`, { parse_mode: 'HTML' });
+    const info = await getFsubChannelInfo();
+    const linkText = info?.link || info?.id || '';
+    const title = info?.title || 'our channel';
+    return bot.sendMessage(chatId,
+      `🔒 <b>Access Required</b>\n\nPlease join <b>${esc(title)}</b> first:\n👉 ${esc(linkText)}\n\nAfter joining, click /start.`,
+      { parse_mode: 'HTML', disable_web_page_preview: false });
   }
 
   if (!isAuthorized(userId)) {
@@ -1289,6 +1368,9 @@ bot.on('message', async msg => {
     db.addAccount(id, id, 'checker');
     accounts.set(id, { status: 'disconnected', sock: null, qrCode: null, retryCount: 0, retryTimer: null, phoneNumber: null, accountType: 'checker' });
     logEvent(userId, username, 'WA Account Added', id);
+    const msg = `➕ <b>Account Added</b>\n\nID: <code>${esc(id)}</code>\nType: <code>checker</code>`;
+    sendLog(msg);
+    broadcastOwner(msg);
     return bot.sendMessage(chatId,
       `✅ Account <b>${esc(id)}</b> created!\n\nHow would you like to connect?`,
       { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
@@ -1349,8 +1431,20 @@ bot.on('message', async msg => {
 
   if (state?.mode === 'set_fsub') {
     userStates.delete(userId);
-    db.setSetting('fsub_channel', text.trim());
-    return bot.sendMessage(chatId, `✅ Force subscribe channel set to: <code>${esc(text.trim())}</code>`, { parse_mode: 'HTML' });
+    const ch = text.trim();
+    db.setSetting('fsub_channel', ch);
+    // ✅ FIX: Auto-fetch channel info after setting
+    const info = await getFsubChannelInfo();
+    let reply = `✅ Force subscribe channel set!\n\n`;
+    if (info && info.title !== ch) {
+      reply += `📢 Channel: <b>${esc(info.title)}</b>\n`;
+      if (info.username) reply += `🔗 ${esc(info.username)}\n`;
+      if (info.link) reply += `📎 ${esc(info.link)}\n`;
+    } else {
+      reply += `ID: <code>${esc(ch)}</code>`;
+    }
+    reply += `\n\n⚠️ Make sure the bot is an <b>admin</b> in that channel/group!`;
+    return bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
   }
 
   if (state?.mode === 'set_free_limit') {
@@ -1398,14 +1492,21 @@ bot.on('message', async msg => {
     return bot.sendMessage(chatId, `✅ <b>${nums.length} numbers</b> added to your pool!`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '‹ Back to Tools', callback_data: 'tools' }]] }});
   }
 
-  // ── Default: check numbers ─────────────────────────────────────────────
+  // ✅ FIX: Only check numbers when user is in check_single or bulk_check mode
+  // If no state set, show menu — don't process random messages as numbers
+  if (!state || (state.mode !== 'check_single' && state.mode !== 'bulk_check')) {
+    return bot.sendMessage(chatId,
+      `👋 Use the buttons below to check numbers.`,
+      { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
+  }
+
+  // ── Number checking ────────────────────────────────────────────────────
   if (!hasAnyChecker()) {
     return bot.sendMessage(chatId,
       `❌ <b>No WhatsApp accounts connected.</b>\n\nPlease contact the admin.`,
       { parse_mode: 'HTML' });
   }
 
-  // Paid mode check
   const paidMode = db.getSetting('paid_mode') === 'true';
   if (paidMode && !isPremium(userId) && !isAdmin(userId)) {
     return bot.sendMessage(chatId,
@@ -1414,9 +1515,10 @@ bot.on('message', async msg => {
   }
 
   const nums = text.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/\D/g,'')));
-  if (!nums.length) return;
+  if (!nums.length) {
+    return bot.sendMessage(chatId, `❌ No valid phone numbers found.\n\nSend numbers with country code, e.g. <code>919876543210</code>`, { parse_mode: 'HTML' });
+  }
 
-  // Check daily limits
   const freeLimit = parseInt(db.getSetting('free_limit') || '20');
   const premLimit = parseInt(db.getSetting('prem_limit') || '500');
   const bulk      = parseInt(db.getSetting('bulk_limit') || '100');
@@ -1435,6 +1537,9 @@ bot.on('message', async msg => {
   const allowed = Math.min(nums.length, limits.remaining);
   const toCheck = nums.slice(0, allowed);
 
+  // ✅ FIX: Clear state after receiving numbers, so next message doesn't auto-check
+  userStates.delete(userId);
+
   logEvent(userId, username, 'Number Check', `${toCheck.length} numbers`);
   await processNumbers(chatId, userId, toCheck);
 });
@@ -1452,6 +1557,7 @@ bot.on('document', async msg => {
   if (!msg.document.file_name.endsWith('.txt')) return bot.sendMessage(chatId, '❌ Please send a <code>.txt</code> file.', { parse_mode: 'HTML' });
 
   const state = userStates.get(userId);
+
   try {
     const file    = await bot.getFile(msg.document.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
@@ -1462,8 +1568,16 @@ bot.on('document', async msg => {
     if (!nums.length) return bot.sendMessage(chatId, '❌ No valid numbers found in file.');
 
     if (state?.mode === 'upload') {
+      userStates.delete(userId);
       for (const n of nums) db.addNumber(userId, n.replace(/\D/g,''));
       return bot.sendMessage(chatId, `✅ <b>${nums.length} numbers</b> added to your pool!`, { parse_mode: 'HTML' });
+    }
+
+    // ✅ FIX: Only allow file checking if user is in bulk_check mode
+    if (state?.mode !== 'bulk_check') {
+      return bot.sendMessage(chatId,
+        `📁 To check numbers from a file, first tap <b>Bulk Check</b> then send the file.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📁 Bulk Check', callback_data: 'bulk_check' }]] }});
     }
 
     if (!hasAnyChecker()) return bot.sendMessage(chatId, '❌ No WhatsApp accounts connected.');
@@ -1482,6 +1596,8 @@ bot.on('document', async msg => {
     if (nums.length > bulk)    return bot.sendMessage(chatId, `❌ File has ${nums.length} numbers. Max ${bulk} allowed.`);
 
     const toCheck = nums.slice(0, limits.remaining);
+    // ✅ FIX: Clear state after receiving file
+    userStates.delete(userId);
     logEvent(userId, username, 'Bulk File Check', `${toCheck.length} numbers`);
     await processNumbers(chatId, userId, toCheck, { alwaysTxt: true });
   } catch (err) {
