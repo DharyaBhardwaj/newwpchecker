@@ -189,9 +189,25 @@ async function connectAccount(accountId, accountType = 'checker') {
 
         if (isBanned) {
           db.incrementBanCount(accountId);
-          const msg = `🚫 <b>Account Banned</b>\n\nID: <code>${esc(accountId)}</code>\n\nAuto-disabled. Promoting backup account...`;
-          sendLog(msg);
-          broadcastOwner(msg);
+          const isUserAcct2 = accountId.startsWith('user_');
+          let banMsg;
+          if (isUserAcct2) {
+            const ownerUserId2 = accountId.replace('user_', '');
+            const u2 = db.getUser(parseInt(ownerUserId2));
+            banMsg =
+              `🚫 <b>User WA Banned</b>\n` +
+              `👤 @${esc(u2?.username || ownerUserId2)} (<code>${ownerUserId2}</code>)\n` +
+              `<i>Their WhatsApp number was banned by WA.</i>`;
+            bot.sendMessage(parseInt(ownerUserId2),
+              `⚠️ <b>Your WhatsApp was banned</b> by WhatsApp.\n\n` +
+              `<i>Your number has been disconnected from the bot.\nConsider using a different number.</i>`,
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
+          } else {
+            banMsg = `🚫 <b>Account Banned</b>\n\nID: <code>${esc(accountId)}</code>\n\nAuto-disabled. Promoting backup account...`;
+          }
+          sendLog(banMsg);
+          broadcastOwner(banMsg);
           await wipeSession(accountId);
           await promoteBackupAccount();
           return;
@@ -218,9 +234,28 @@ async function connectAccount(accountId, accountType = 'checker') {
         acct.phoneNumber = sock.user?.id?.split(':')[0] || null;
         db.setAccountConnected(accountId, true, acct.phoneNumber);
         await saveSession(accountId);
-        const msg = `✅ <b>Account Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>+${acct.phoneNumber}</code>\nType: <code>${type}</code>`;
-        sendLog(msg);
-        broadcastOwner(msg);
+        // Check if this is a user-submitted account
+        const isUserAcct = accountId.startsWith('user_');
+        let connMsg;
+        if (isUserAcct) {
+          const ownerUserId = accountId.replace('user_', '');
+          const u = db.getUser(parseInt(ownerUserId));
+          connMsg =
+            `✅ <b>User WA Connected</b>\n` +
+            `👤 @${esc(u?.username || ownerUserId)} (<code>${ownerUserId}</code>)\n` +
+            `📱 Number: <code>+${acct.phoneNumber}</code>`;
+          // Notify the user too
+          bot.sendMessage(parseInt(ownerUserId),
+            `✅ <b>WhatsApp Connected!</b>\n\n` +
+            `📱 <code>+${acct.phoneNumber}</code>\n\n` +
+            `<i>Your account is now active and helping check numbers.</i>`,
+            { parse_mode: 'HTML' }
+          ).catch(() => {});
+        } else {
+          connMsg = `✅ <b>Account Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>+${acct.phoneNumber}</code>\nType: <code>${type}</code>`;
+        }
+        sendLog(connMsg);
+        broadcastOwner(connMsg);
       }
     });
 
@@ -533,13 +568,18 @@ function isMaintenanceMode() {
 
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────
 function mainMenu(userId) {
-  const admin = isAdmin(userId);
+  const admin      = isAdmin(userId);
+  const userWaMode = db.getSetting('user_wa_mode') === 'on';
   const kb = [
     [{ text: '🔍 Check Number', callback_data: 'check_number' }, { text: '📋 Bulk Check', callback_data: 'bulk_check' }],
-    [{ text: '🧰 Tools', callback_data: 'tools' },              { text: '👤 My Profile', callback_data: 'profile' }],
+    [{ text: '🧰 Tools', callback_data: 'tools' },               { text: '👤 My Profile', callback_data: 'profile' }],
     [{ text: '💎 Premium Plans', callback_data: 'premium_info' },{ text: '🎁 Referral', callback_data: 'referral' }],
-    [{ text: '📡 Bot Status', callback_data: 'status' },         { text: '📖 Help', callback_data: 'help' }],
+    [{ text: '📡 Bot Status', callback_data: 'status' },          { text: '📖 Help', callback_data: 'help' }],
   ];
+  // Show WhatsApp button to normal users only when owner has enabled it
+  if (!admin && userWaMode) {
+    kb.push([{ text: '📱 Connect WhatsApp', callback_data: 'user_wa_panel' }]);
+  }
   if (admin) kb.push([{ text: '⚙️ Admin Panel', callback_data: 'owner_panel' }]);
   return { inline_keyboard: kb };
 }
@@ -756,7 +796,18 @@ bot.on('callback_query', async query => {
     case 'export_profile': return handleExportProfile(chatId, userId);
 
     // Owner panel sub-menus
-    case 'op_accounts':  return showWaAccounts(chatId, userId, msgId);
+    case 'op_accounts':    return showWaAccounts(chatId, userId, msgId);
+    case 'toggle_user_wa': {
+      if (!isAdmin(userId)) return;
+      const cur = db.getSetting('user_wa_mode') === 'on';
+      db.setSetting('user_wa_mode', cur ? 'off' : 'on');
+      sendLog(`📱 <b>User WA Mode ${cur ? 'Disabled' : 'Enabled'}</b>\nBy: <code>${userId}</code>`);
+      return showOwnerPanel(chatId, userId, msgId);
+    }
+    case 'user_wa_panel':   return showUserWaPanel(chatId, userId, msgId);
+    case 'user_wa_qr':      return handleUserWaQR(chatId, userId, msgId);
+    case 'user_wa_pair':    return handleUserWaPairPrompt(chatId, userId, msgId);
+    case 'user_wa_disconnect': return handleUserWaDisconnect(chatId, userId, msgId);
     case 'op_add_acct':  return startAddAccount(chatId, userId, msgId);
     case 'op_users':     return showUsersList(chatId, userId, msgId);
     case 'op_users_dl':  return handleUsersDownload(chatId, userId);
@@ -1144,6 +1195,7 @@ async function showOwnerPanel(chatId, userId, msgId) {
     `🔧 Maintenance: ${maint} | 💰 Paid Mode: ${paidMode}`,
     { inline_keyboard: [
       [{ text: '📱 WA Accounts', callback_data: 'op_accounts' }, { text: '➕ Add Account', callback_data: 'op_add_acct' }],
+      [{ text: db.getSetting('user_wa_mode')==='on' ? '🟢 User WA: ON  — Tap to Disable' : '🔴 User WA: OFF — Tap to Enable', callback_data: 'toggle_user_wa' }],
       [{ text: '👥 Users', callback_data: 'op_users' }, { text: '💎 Add Premium', callback_data: 'op_add_premium' }],
       [{ text: '📢 Broadcast', callback_data: 'op_broadcast' }, { text: '📋 Logs', callback_data: 'op_logs' }],
       [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🔒 Force Sub', callback_data: 'op_fsub' }],
@@ -1152,7 +1204,131 @@ async function showOwnerPanel(chatId, userId, msgId) {
     ]});
 }
 
-// ─── WA ACCOUNTS PANEL ────────────────────────────────────────────────────
+// ─── USER WA PANEL ───────────────────────────────────────────────────────────
+// Users can add their own WhatsApp accounts when owner enables user_wa_mode
+// Account ID = "user_{telegramId}" — namespaced so no conflict with admin accounts
+
+function getUserWaAccountId(userId) {
+  return `user_${userId}`;
+}
+
+async function showUserWaPanel(chatId, userId, msgId) {
+  if (db.getSetting('user_wa_mode') !== 'on' && !isAdmin(userId)) {
+    return editMsg(chatId, msgId, `❌ <b>This feature is currently disabled.</b>`, backBtn);
+  }
+
+  const accountId = getUserWaAccountId(userId);
+  const acct      = accounts.get(accountId);
+  const dbAcct    = db.getAccount(accountId);
+  const status    = acct?.status || (dbAcct?.is_connected ? 'connected' : 'disconnected');
+  const statusEm  = { connected:'🟢', waiting_for_scan:'⏳', connecting:'🔄', banned:'🚫', disconnected:'🔴' }[status] || '🔴';
+  const phone     = acct?.phoneNumber || dbAcct?.phone_number || null;
+
+  let text =
+    `📱 <b>My WhatsApp Account</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `<b>Status:</b> ${statusEm} <b>${status.replace('_', ' ')}</b>\n`;
+  if (phone) text += `<b>Number:</b> <code>+${phone}</code>\n`;
+  text +=
+    `\n<i>Connect your WhatsApp to help the bot\ncheck numbers faster.</i>\n\n` +
+    `<b>⚠️ Note:</b> <i>Uses WhatsApp Web — secondary\nnumber recommended.</i>`;
+
+  const kb = { inline_keyboard: [] };
+
+  if (status === 'connected') {
+    kb.inline_keyboard.push([{ text: '⏹ Disconnect', callback_data: 'user_wa_disconnect' }]);
+  } else {
+    kb.inline_keyboard.push([
+      { text: '📷 Connect via QR',      callback_data: 'user_wa_qr' },
+      { text: '🔗 Connect via Pairing', callback_data: 'user_wa_pair' },
+    ]);
+  }
+  kb.inline_keyboard.push([{ text: '🔄 Refresh', callback_data: 'user_wa_panel' }]);
+  kb.inline_keyboard.push([{ text: '‹ Back to Menu', callback_data: 'main_menu' }]);
+
+  return editMsg(chatId, msgId, text, kb);
+}
+
+async function handleUserWaQR(chatId, userId, msgId) {
+  if (db.getSetting('user_wa_mode') !== 'on' && !isAdmin(userId)) return;
+
+  const accountId = getUserWaAccountId(userId);
+  const u = db.getUser(userId);
+
+  const statusMsg = await bot.sendMessage(chatId,
+    `⏳ <b>Generating QR Code...</b>\n<i>Please wait a moment.</i>`,
+    { parse_mode: 'HTML' });
+
+  // Register account if not exists
+  db.addAccount(accountId, `@${u?.username || userId}`, 'checker');
+  connectAccount(accountId, 'checker');
+
+  for (let i = 0; i < 25; i++) {
+    await sleep(1000);
+    const a = accounts.get(accountId);
+    if (a?.status === 'connected') {
+      await bot.editMessageText(
+        `✅ <b>Already connected!</b>`,
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML' }
+      );
+      return showUserWaPanel(chatId, userId, msgId);
+    }
+    if (a?.qrCode) {
+      const buf = Buffer.from(a.qrCode.split(',')[1], 'base64');
+      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+      await bot.sendPhoto(chatId, buf, {
+        caption:
+          `📱 <b>Scan this QR Code</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n\n` +
+          `1️⃣ Open <b>WhatsApp</b> on your phone\n` +
+          `2️⃣ Go to <b>Settings → Linked Devices</b>\n` +
+          `3️⃣ Tap <b>Link a Device</b>\n` +
+          `4️⃣ Scan this code\n\n` +
+          `⏳ <i>Expires in ~60 seconds</i>`,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'user_wa_panel' }]] },
+      });
+      return;
+    }
+  }
+  await bot.editMessageText(`❌ Failed to generate QR. Please try again.`, {
+    chat_id: chatId, message_id: statusMsg.message_id,
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '🔄 Try Again', callback_data: 'user_wa_qr' }]] },
+  });
+}
+
+async function handleUserWaPairPrompt(chatId, userId, msgId) {
+  if (db.getSetting('user_wa_mode') !== 'on' && !isAdmin(userId)) return;
+  userStates.set(userId, { mode: 'user_wa_pair' });
+  return editMsg(chatId, msgId,
+    `🔗 <b>Connect via Pairing Code</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Send your WhatsApp number <b>with country code</b>:\n\n` +
+    `<code>919876543210</code>  <i>(India)</i>\n` +
+    `<code>14155550123</code>   <i>(USA)</i>\n\n` +
+    `<i>No + or spaces needed.</i>`,
+    backBtn);
+}
+
+async function handleUserWaDisconnect(chatId, userId, msgId) {
+  const accountId = getUserWaAccountId(userId);
+  await disconnectAccount(accountId);
+
+  const u = db.getUser(userId);
+  const logMsg =
+    `🔌 <b>User WA Disconnected</b>\n` +
+    `👤 @${esc(u?.username || '')} (<code>${userId}</code>)\n` +
+    `🆔 Account: <code>${accountId}</code>`;
+  sendLog(logMsg);
+  broadcastOwner(logMsg);
+
+  return editMsg(chatId, msgId,
+    `✅ <b>WhatsApp Disconnected</b>\n\n<i>Your account has been unlinked.</i>`,
+    { inline_keyboard: [[{ text: '‹ Back', callback_data: 'user_wa_panel' }]] });
+}
+
+// ─── WA ACCOUNTS PANEL ────────────────────────────────────────────────────────
 async function showWaAccounts(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
   const all = db.getAllAccounts();
@@ -1709,6 +1885,44 @@ bot.on('message', async msg => {
         [{ text: '🔗 Pairing Code', callback_data: `wa_pair_${id}` }],
         [{ text: '‹ Back', callback_data: 'op_accounts' }],
       ]}});
+  }
+
+  if (state?.mode === 'user_wa_pair') {
+    const accountId = getUserWaAccountId(userId);
+    userStates.delete(userId);
+    const u = db.getUser(userId);
+    const statusMsg = await bot.sendMessage(chatId,
+      `⏳ <b>Generating pairing code...</b>`, { parse_mode: 'HTML' });
+    try {
+      db.addAccount(accountId, `@${u?.username || userId}`, 'checker');
+      const code = await getPairingCode(accountId, text.trim(), 'checker');
+
+      // Notify owner + log
+      const logMsg =
+        `🔗 <b>User WA Pairing Code Sent</b>\n` +
+        `👤 @${esc(username)} (<code>${userId}</code>)\n` +
+        `📱 Number: <code>${text.trim()}</code>`;
+      sendLog(logMsg);
+      broadcastOwner(logMsg);
+
+      return bot.editMessageText(
+        `🔗 <b>Your Pairing Code</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Code: <code>${code}</code>\n\n` +
+        `<b>Steps:</b>\n` +
+        `1️⃣ Open WhatsApp → Settings\n` +
+        `2️⃣ Tap <b>Linked Devices</b>\n` +
+        `3️⃣ Tap <b>Link a Device</b>\n` +
+        `4️⃣ Tap <b>Link with phone number</b>\n` +
+        `5️⃣ Enter the code above\n\n` +
+        `✅ <i>Bot will notify you when connected.</i>`,
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'user_wa_panel' }]] } });
+    } catch (err) {
+      return bot.editMessageText(
+        `❌ <b>Pairing Failed</b>\n\n<code>${esc(err.message)}</code>`,
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML', reply_markup: backBtn });
+    }
   }
 
   if (state?.mode === 'pair_wa') {
