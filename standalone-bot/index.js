@@ -1087,23 +1087,34 @@ async function startAddAccount(chatId, userId, msgId) {
 // ─── USERS LIST ───────────────────────────────────────────────────────────
 async function showUsersList(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
-  const users = db.getAllUsers().slice(0, 30);
-  const total = db.getAllUsers().length;
-  const kb    = users.map(u => {
+  const allUsers = db.getAllUsers();
+  const total    = allUsers.length;
+  const users    = allUsers.slice(0, 20);
+
+  const kb = users.map(u => {
     const role = u.role === 'owner' ? '👑' : u.role === 'admin' ? '⭐' : db.isPremiumActive(u.telegram_id) ? '💎' : u.is_blocked ? '🚫' : '👤';
-    return [{ text: `${role} @${u.username||'unknown'} (${u.telegram_id})`, callback_data: `user_info_${u.telegram_id}` }];
+    const name = (u.username || 'noname').slice(0, 15);
+    // callback_data must be under 64 bytes — just use ID
+    return [{ text: `${role} ${u.telegram_id} @${name}`, callback_data: `user_info_${u.telegram_id}` }];
   });
   kb.push([{ text: '‹ Back', callback_data: 'owner_panel' }]);
-  return editMsg(chatId, msgId,
-    `👥 <b>Users (${total})</b>\n\nShowing first 30. Use /user <id> for specific user.`,
-    { inline_keyboard: kb });
+
+  const text = `👥 <b>Users (${total} total)</b>\n\nShowing first ${users.length}.\nUse /user &lt;id&gt; for a specific user.`;
+
+  // sendMessage instead of editMsg — avoids silent failures with large keyboards
+  await bot.sendMessage(chatId, text, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: kb },
+  }).catch(() => {});
 }
 
 // ─── USER INFO ────────────────────────────────────────────────────────────
 async function handleUserInfo(chatId, adminId, msgId, targetId) {
   if (!isAdmin(adminId)) return;
   const u = db.getUser(targetId);
-  if (!u) return editMsg(chatId, msgId, `❌ User not found.`, backBtn);
+  if (!u) {
+    return bot.sendMessage(chatId, `❌ User not found.`, { parse_mode: 'HTML', reply_markup: backBtn });
+  }
 
   const role    = u.role === 'owner' ? '👑 Owner' : u.role === 'admin' ? '⭐ Admin' : '👤 User';
   const prem    = db.isPremiumActive(targetId);
@@ -1120,10 +1131,10 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
     prem
       ? [{ text: '❌ Remove Premium', callback_data: `user_remprem_${targetId}` }]
       : [],
-    [{ text: '‹ Back', callback_data: 'op_users' }],
+    [{ text: '‹ Back to Users', callback_data: 'op_users' }],
   ].filter(r => r.length)};
 
-  return editMsg(chatId, msgId,
+  const text =
     `👤 <b>User Info</b>\n\n` +
     `🆔 ID: <code>${targetId}</code>\n` +
     `👤 @${esc(u.username)||'N/A'} — ${esc(u.first_name||'')}\n` +
@@ -1131,28 +1142,30 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
     `💎 Premium: ${premTxt}\n` +
     `🚫 Banned: ${banned}\n` +
     `📊 Checks: ${fmt(u.numbers_checked)}\n` +
-    `📅 Joined: ${new Date(u.joined_at).toLocaleDateString()}`,
-    kb);
+    `📅 Joined: ${new Date(u.joined_at).toLocaleDateString()}`;
+
+  // Always sendMessage — msgId may be from a different message after showUsersList
+  return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
 }
 
 async function handleUserBan(chatId, adminId, msgId, targetId, ban) {
   if (!isAdmin(adminId)) return;
   db.blockUser(targetId, ban);
-  logEvent(adminId, '', ban ? 'User Banned' : 'User Unbanned', String(targetId));
+  sendLog(`${ban ? '🚫' : '✅'} <b>User ${ban ? 'Banned' : 'Unbanned'}</b>\n🆔 <code>${targetId}</code>`);
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
 async function handleUserRole(chatId, adminId, msgId, targetId, role) {
   if (!isOwner(adminId) && role === 'admin') return;
   db.updateRole(targetId, role);
-  logEvent(adminId, '', `User ${role === 'admin' ? 'Promoted' : 'Demoted'}`, String(targetId));
+  sendLog(`🎭 <b>User ${role === 'admin' ? 'Promoted to Admin' : 'Demoted'}</b>\n🆔 <code>${targetId}</code>`);
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
 async function handleRemovePremium(chatId, adminId, msgId, targetId) {
   if (!isAdmin(adminId)) return;
   db.removePremium(targetId);
-  logEvent(adminId, '', 'Premium Removed', String(targetId));
+  sendLog(`💎 <b>Premium Removed</b>\n🆔 <code>${targetId}</code>`);
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
