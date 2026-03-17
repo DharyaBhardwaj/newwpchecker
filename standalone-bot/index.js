@@ -557,25 +557,31 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
         bot.sendMessage(referrer.telegram_id,
           `🎉 <b>New Referral!</b>\n\n@${esc(username) || userId} joined using your link.\nYou earned <b>+${bonusChecks}</b> bonus checks!`,
           { parse_mode: 'HTML' }).catch(() => {});
-        logEvent(userId, username, 'Joined via Referral', `Referred by ${referrer.telegram_id}`);
+        // Log silently — no extra message to user
+        sendLog(`🔗 <b>Referral Join</b>\n👤 @${esc(username)} (<code>${userId}</code>)\nReferred by: <code>${referrer.telegram_id}</code>`);
       }
     }
   }
 
-  if (isNew) logEvent(userId, username, 'New User', firstName);
+  // Log new user silently to log group only — NOT to the chat
+  if (isNew) {
+    sendLog(`👋 <b>New User</b>\n👤 @${esc(username)} (<code>${userId}</code>)\nName: ${esc(firstName)}`);
+  }
 
   const isMember = await checkForceSub(userId);
   if (!isMember) {
-    const ch = db.getSetting('fsub_channel');
+    const info = await getFsubChannelInfo();
+    const linkText = info?.link || info?.id || '';
+    const title = info?.title || 'our channel';
     return bot.sendMessage(chatId,
-      `🔒 <b>Access Required</b>\n\nTo use this bot, you must join our channel first.\n\n👉 <a href="${esc(ch)}">${esc(ch)}</a>\n\nAfter joining, click /start again.`,
+      `🔒 <b>Access Required</b>\n\nTo use this bot, you must join:\n\n👉 <b><a href="${esc(linkText)}">${esc(title)}</a></b>\n\nAfter joining, click /start again.`,
       { parse_mode: 'HTML', disable_web_page_preview: false });
   }
 
-  logEvent(userId, username, '/start');
-  // ✅ FIX: Clear any stale state on /start
+  // Clear any stale state on /start
   userStates.delete(userId);
-  bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
+  // ONE message only
+  return bot.sendMessage(chatId, welcomeText(userId), { parse_mode: 'HTML', reply_markup: mainMenu(userId) });
 });
 
 // ─── FORCE SUBSCRIBE CHECK ─────────────────────────────────────────────────
@@ -621,20 +627,31 @@ bot.on('callback_query', async query => {
   const data      = query.data;
   const username  = query.from.username || '';
 
-  await bot.answerCallbackQuery(query.id).catch(() => {});
-
+  // Answer callback ONCE — never call again below
   if (isMaintenanceMode() && !isAdmin(userId)) {
-    return bot.sendMessage(chatId,
-      `🔧 <b>Maintenance Mode</b>\n\nBot is currently under maintenance.`,
-      { parse_mode: 'HTML' });
+    await bot.answerCallbackQuery(query.id, { text: '🔧 Maintenance mode. Please wait.', show_alert: true }).catch(() => {});
+    return;
   }
 
   const isMember = await checkForceSub(userId);
   if (!isMember) {
     const info = await getFsubChannelInfo();
-    const linkText = info?.link || info?.id || '';
-    return bot.answerCallbackQuery(query.id, { text: `Please join our channel first!`, show_alert: true }).catch(() => {});
+    const title = info?.title || 'our channel';
+    await bot.answerCallbackQuery(query.id, { text: `🔒 Please join ${title} first!`, show_alert: true }).catch(() => {});
+    return;
   }
+
+  // Ensure user exists in DB
+  db.createUser(userId, query.from.username || '', query.from.first_name || '');
+
+  // Authorization check
+  if (!isAuthorized(userId)) {
+    await bot.answerCallbackQuery(query.id, { text: '🔒 Access denied. Contact admin.', show_alert: true }).catch(() => {});
+    return;
+  }
+
+  // Answer the callback — only once, here
+  await bot.answerCallbackQuery(query.id).catch(() => {});
 
   // ── Dynamic callbacks ──
   if (data.startsWith('wa_qr_'))         return handleWaQR(chatId, userId, msgId, data.replace('wa_qr_',''));
@@ -766,9 +783,7 @@ async function showMainMenu(chatId, userId, msgId) {
 }
 
 // ─── CHECK NUMBER ─────────────────────────────────────────────────────────
-// ✅ FIX: Sets mode to 'check_single' so only then numbers are processed
 async function showCheckNumber(chatId, userId, msgId) {
-  if (!isAuthorized(userId)) return;
   userStates.set(userId, { mode: 'check_single' });
   return editMsg(chatId, msgId,
     `🔍 <b>Check Single Number</b>\n\nSend a phone number to verify:\n\n• With country code: <code>919876543210</code>\n• Or with +: <code>+919876543210</code>`,
@@ -776,9 +791,7 @@ async function showCheckNumber(chatId, userId, msgId) {
 }
 
 // ─── BULK CHECK ───────────────────────────────────────────────────────────
-// ✅ FIX: Sets mode to 'bulk_check' so only then bulk is processed
 async function showBulkCheck(chatId, userId, msgId) {
-  if (!isAuthorized(userId)) return;
   const freeLimit  = parseInt(db.getSetting('free_limit')  || '20');
   const premLimit  = parseInt(db.getSetting('prem_limit')  || '500');
   const bulkLimit  = parseInt(db.getSetting('bulk_limit')  || '100');
@@ -1314,8 +1327,12 @@ bot.on('message', async msg => {
   const firstName = msg.from.first_name || '';
   const text      = msg.text;
 
-  // Ignore commands (handled by onText)
+  // ✅ FIX: Ignore ALL commands — onText handles them separately
+  // This prevents /start from firing BOTH onText AND message handler (double message bug)
   if (!text || text.startsWith('/')) return;
+
+  // ✅ FIX: Ignore forwarded messages and channel posts
+  if (msg.forward_date || msg.chat.type === 'channel') return;
 
   if (isMaintenanceMode() && !isAdmin(userId)) {
     return bot.sendMessage(chatId, `🔧 <b>Maintenance Mode</b>\n\nBot is under maintenance. Please check back soon.`, { parse_mode: 'HTML' });
