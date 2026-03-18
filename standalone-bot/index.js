@@ -25,8 +25,12 @@ try { config = require('./config'); } catch (_) { config = require('./config.exa
 // ─── BOOT ENV OVERRIDES ──────────────────────────────────────────────────────
 // These run after DB is ready — called once at startup
 function applyEnvSettings() {
-  if (process.env.FSUB_CHANNEL) db.setSetting('fsub_channel', process.env.FSUB_CHANNEL);
-  if (process.env.FSUB_IMAGE)   db.setSetting('fsub_image',   process.env.FSUB_IMAGE);
+  if (process.env.FSUB_IMAGE) db.setSetting('fsub_image', process.env.FSUB_IMAGE);
+  // FSUB_CHANNELS: comma-separated channel IDs/usernames e.g. "@ch1,-100123456789"
+  if (process.env.FSUB_CHANNELS) {
+    const chs = process.env.FSUB_CHANNELS.split(',').map(s => s.trim()).filter(Boolean);
+    for (const ch of chs) db.addFsubChannel(ch, ch, '');
+  }
   if (process.env.MENU_IMAGE)   db.setSetting('menu_image',   process.env.MENU_IMAGE);
 }
 
@@ -666,35 +670,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
   const isMember = await checkForceSub(userId);
   if (!isMember) {
-    const info = await getFsubChannelInfo();
-    const linkText = info?.link || info?.id || '';
-    const title    = info?.title || 'our channel';
-    const fsub_img = db.getSetting('fsub_image') || null;
-    const fsubText =
-      `🔐 <b>Access Restricted</b>\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `To use <b>WA Number Checker</b>, you must\n` +
-      `first join our official channel.\n\n` +
-      `📢 <b>Channel:</b> <a href="${esc(linkText)}">${esc(title)}</a>\n\n` +
-      `<i>① Tap the button below to join\n` +
-      `② Come back and click /start</i>\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━`;
-
-    const fsubKb = { inline_keyboard: [
-      [{ text: `📢 Join — ${esc(title)}`, url: linkText }],
-      [{ text: '✅ I have joined — Check Again', callback_data: 'fsub_verify' }],
-    ]};
-
-    if (fsub_img) {
-      return bot.sendPhoto(chatId, fsub_img, {
-        caption:      fsubText,
-        parse_mode:   'HTML',
-        reply_markup: fsubKb,
-      }).catch(() =>
-        bot.sendMessage(chatId, fsubText, { parse_mode: 'HTML', reply_markup: fsubKb })
-      );
-    }
-    return bot.sendMessage(chatId, fsubText, { parse_mode: 'HTML', reply_markup: fsubKb });
+    return sendFsubPrompt(chatId, userId);
   }
 
   userStates.delete(userId);
@@ -703,37 +679,87 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
 // ─── FORCE SUBSCRIBE CHECK ─────────────────────────────────────────────────
 // ✅ FIX: Fetch channel info — name + invite link automatically
+// ─── FSUB: check if user has joined ALL required channels ────────────────
 async function checkForceSub(userId) {
   if (isAdmin(userId)) return true;
-  const ch = db.getSetting('fsub_channel');
-  if (!ch) return true;
-  try {
-    const m = await bot.getChatMember(ch, userId);
-    return ['member','administrator','creator'].includes(m.status);
-  } catch (_) { return true; }
+  const channels = db.getAllFsubChannels();
+  if (!channels.length) return true;
+  for (const ch of channels) {
+    try {
+      const m = await bot.getChatMember(ch.channel_id, userId);
+      if (!['member','administrator','creator'].includes(m.status)) return false;
+    } catch (_) {
+      // Can't check — assume OK so bot doesn't break if removed from channel
+    }
+  }
+  return true;
 }
 
-// ✅ FIX: Get channel display name and invite link automatically
-async function getFsubChannelInfo() {
-  const ch = db.getSetting('fsub_channel');
-  if (!ch) return null;
+// Get fresh info for a single channel and save it to DB
+async function refreshFsubChannel(channelId) {
   try {
-    const chat = await bot.getChat(ch);
-    let inviteLink = chat.invite_link || null;
-    // If no invite link stored, try to create/fetch one
-    if (!inviteLink) {
-      try { inviteLink = await bot.exportChatInviteLink(ch); } catch (_) {}
-    }
-    return {
-      id: ch,
-      title: chat.title || chat.username || ch,
-      username: chat.username ? `@${chat.username}` : null,
-      inviteLink,
-      link: chat.username ? `https://t.me/${chat.username}` : inviteLink,
-    };
+    const chat = await bot.getChat(channelId);
+    let link = chat.invite_link || null;
+    if (!link && chat.username) link = `https://t.me/${chat.username}`;
+    if (!link) { try { link = await bot.exportChatInviteLink(channelId); } catch (_) {} }
+    const title = chat.title || chat.username || channelId;
+    db.updateFsubChannel(channelId, title, link || '');
+    return { channel_id: channelId, title, link };
   } catch (_) {
-    return { id: ch, title: ch, username: null, inviteLink: null, link: ch };
+    return { channel_id: channelId, title: channelId, link: '' };
   }
+}
+
+// Get channels user has NOT joined yet
+async function getMissingChannels(userId) {
+  if (isAdmin(userId)) return [];
+  const channels = db.getAllFsubChannels();
+  const missing = [];
+  for (const ch of channels) {
+    try {
+      const m = await bot.getChatMember(ch.channel_id, userId);
+      if (!['member','administrator','creator'].includes(m.status)) {
+        missing.push(ch);
+      }
+    } catch (_) {}
+  }
+  return missing;
+}
+
+// ─── FSUB PROMPT — shows all channels user must join ─────────────────────
+async function sendFsubPrompt(chatId, userId) {
+  const missing  = await getMissingChannels(userId);
+  const fsubImg  = db.getSetting('fsub_image') || null;
+  const total    = db.getAllFsubChannels().length;
+  const doneCount = total - missing.length;
+
+  let body =
+    `🔐 <b>Access Restricted</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `To use <b>WA Number Checker</b>, you must\n` +
+    `join <b>all</b> required channels.\n\n` +
+    `<b>📋 Progress: ${doneCount}/${total} joined</b>\n\n`;
+
+  const kb = [];
+  for (const ch of missing) {
+    const link = ch.link || `https://t.me/${ch.channel_id.replace('@','')}`;
+    body += `❌ <a href="${esc(link)}">${esc(ch.title || ch.channel_id)}</a>\n`;
+    kb.push([{ text: `📢 Join — ${esc(ch.title || ch.channel_id)}`, url: link }]);
+  }
+
+  body += `\n<i>Join all channels above, then tap the button below.</i>`;
+  kb.push([{ text: '✅ I have joined all — Verify', callback_data: 'fsub_verify' }]);
+
+  if (fsubImg) {
+    return bot.sendPhoto(chatId, fsubImg, {
+      caption:      body,
+      parse_mode:   'HTML',
+      reply_markup: { inline_keyboard: kb },
+    }).catch(() =>
+      bot.sendMessage(chatId, body, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb }, disable_web_page_preview: true })
+    );
+  }
+  return bot.sendMessage(chatId, body, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb }, disable_web_page_preview: true });
 }
 
 // ─── CALLBACK ROUTER ──────────────────────────────────────────────────────
@@ -752,9 +778,7 @@ bot.on('callback_query', async query => {
 
   const isMember = await checkForceSub(userId);
   if (!isMember) {
-    const info = await getFsubChannelInfo();
-    const title = info?.title || 'our channel';
-    await bot.answerCallbackQuery(query.id, { text: `🔒 Please join ${title} first!`, show_alert: true }).catch(() => {});
+    await bot.answerCallbackQuery(query.id, { text: '🔒 Please join all required channels first!', show_alert: true }).catch(() => {});
     return;
   }
 
@@ -771,6 +795,12 @@ bot.on('callback_query', async query => {
   await bot.answerCallbackQuery(query.id).catch(() => {});
 
   // ── Dynamic callbacks ──
+  if (data.startsWith('fsub_del_')) {
+    if (!isAdmin(userId)) return;
+    const chId = data.replace('fsub_del_', '');
+    db.removeFsubChannel(chId);
+    return showFsubSettings(chatId, userId, msgId);
+  }
   if (data.startsWith('wa_qr_'))         return handleWaQR(chatId, userId, msgId, data.replace('wa_qr_',''));
   if (data.startsWith('wa_pair_'))       return handleWaPairPrompt(chatId, userId, msgId, data.replace('wa_pair_',''));
   if (data.startsWith('wa_dis_'))        return handleWaDisconnect(chatId, userId, msgId, data.replace('wa_dis_',''));
@@ -846,6 +876,9 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       db.setSetting('fsub_channel', '');
       return showFsubSettings(chatId, userId, msgId);
+
+    // Dynamic: remove a specific fsub channel
+    // handled in startsWith block below
 
     case 'fsub_img_remove':
       if (!isAdmin(userId)) return;
@@ -1646,31 +1679,43 @@ async function startBroadcast(chatId, userId, msgId) {
 // ✅ FIX: Shows channel name and invite link automatically
 async function showFsubSettings(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
-  const ch      = db.getSetting('fsub_channel');
-  const fsubImg = db.getSetting('fsub_image') || null;
-  let body = `🔒 <b>Force Subscribe Settings</b>\n` +
-             `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  const channels = db.getAllFsubChannels();
+  const fsubImg  = db.getSetting('fsub_image') || null;
 
-  if (ch) {
-    const info = await getFsubChannelInfo();
-    body += `<b>📢 Channel:</b> ${info ? `<b>${esc(info.title)}</b>` : `<code>${esc(ch)}</code>`}\n`;
-    if (info?.username) body += `<b>🔗 Handle:</b> ${esc(info.username)}\n`;
-    if (info?.link)     body += `<b>📎 Link:</b> ${esc(info.link)}\n`;
-    body += `<b>🆔 ID:</b> <code>${esc(ch)}</code>\n`;
+  let body =
+    `🔒 <b>Force Subscribe Settings</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `<b>📋 Required Channels (${channels.length}):</b>\n`;
+
+  if (channels.length === 0) {
+    body += `<i>None — bot is open to all users.</i>\n`;
   } else {
-    body += `<i>No channel set — bot is open to all users.</i>\n`;
+    for (let i = 0; i < channels.length; i++) {
+      const ch = channels[i];
+      const link = ch.link || ch.channel_id;
+      body += `${i+1}. <a href="${esc(link)}">${esc(ch.title || ch.channel_id)}</a> <code>${esc(ch.channel_id)}</code>\n`;
+    }
   }
 
-  body += `\n<b>🖼 Thumbnail:</b> ${fsubImg ? '✅ Set' : '❌ Not set'}\n`;
-  body += `<i>(Image shown with the join prompt)</i>`;
+  body += `\n<b>🖼 Prompt Image:</b> ${fsubImg ? '✅ Set' : '❌ Not set'}\n`;
+  body += `<i>Users must join ALL channels above.</i>`;
 
-  const kb = { inline_keyboard: [
-    [{ text: ch ? '✏️ Change Channel' : '➕ Set Channel', callback_data: 'set_fsub_input' },
-     { text: '🖼 Set Image', callback_data: 'set_fsub_image' }],
-    ch ? [{ text: '🗑 Remove Channel', callback_data: 'fsub_remove' }] : [],
-    fsubImg ? [{ text: '🗑 Remove Image', callback_data: 'fsub_img_remove' }] : [],
-    [{ text: '‹ Back', callback_data: 'owner_panel' }],
-  ].filter(r => r.length)};
+  const kb = { inline_keyboard: [] };
+
+  // One remove button per channel
+  for (const ch of channels) {
+    kb.inline_keyboard.push([{
+      text: `🗑 Remove: ${(ch.title || ch.channel_id).slice(0,25)}`,
+      callback_data: `fsub_del_${ch.channel_id}`,
+    }]);
+  }
+
+  kb.inline_keyboard.push([
+    { text: '➕ Add Channel', callback_data: 'set_fsub_input' },
+    { text: '🖼 Set Image',   callback_data: 'set_fsub_image' },
+  ]);
+  if (fsubImg) kb.inline_keyboard.push([{ text: '🗑 Remove Image', callback_data: 'fsub_img_remove' }]);
+  kb.inline_keyboard.push([{ text: '‹ Back', callback_data: 'owner_panel' }]);
 
   return editMsg(chatId, msgId, body, kb);
 }
@@ -1750,17 +1795,22 @@ async function setupLogGroup(chatId, userId, msgId) {
 
 // ─── FSUB VERIFY BUTTON ──────────────────────────────────────────────────
 async function handleFsubVerify(query) {
-  const userId = query.from.id;
-  const chatId = query.message.chat.id;
-  const msgId  = query.message.message_id;
-  const isMember = await checkForceSub(userId);
-  if (isMember) {
+  const userId  = query.from.id;
+  const chatId  = query.message.chat.id;
+  const msgId   = query.message.message_id;
+  const missing = await getMissingChannels(userId);
+
+  if (missing.length === 0) {
     userStates.delete(userId);
-    await bot.answerCallbackQuery(query.id, { text: '✅ Access granted!', show_alert: false }).catch(() => {});
+    await bot.answerCallbackQuery(query.id, { text: '✅ All channels joined! Access granted.', show_alert: false }).catch(() => {});
     return editMsg(chatId, msgId, welcomeText(userId), mainMenu(userId));
-  } else {
-    return bot.answerCallbackQuery(query.id, { text: '❌ You have not joined yet. Please join first!', show_alert: true }).catch(() => {});
   }
+
+  const names = missing.map(c => c.title || c.channel_id).join(', ');
+  await bot.answerCallbackQuery(query.id, {
+    text: `❌ Still need to join: ${names}`,
+    show_alert: true,
+  }).catch(() => {});
 }
 
 // ─── GET / CHANGE NUMBER ─────────────────────────────────────────────────
@@ -1849,14 +1899,7 @@ bot.on('message', async msg => {
   db.createUser(userId, username, firstName);
 
   const isMember = await checkForceSub(userId);
-  if (!isMember) {
-    const info = await getFsubChannelInfo();
-    const linkText = info?.link || info?.id || '';
-    const title = info?.title || 'our channel';
-    return bot.sendMessage(chatId,
-      `🔒 <b>Access Required</b>\n\nPlease join <b>${esc(title)}</b> first:\n👉 ${esc(linkText)}\n\nAfter joining, click /start.`,
-      { parse_mode: 'HTML', disable_web_page_preview: false });
-  }
+  if (!isMember) return sendFsubPrompt(chatId, userId);
 
   if (!isAuthorized(userId)) {
     if (config.OWNER_ID) {
@@ -2010,20 +2053,18 @@ bot.on('message', async msg => {
 
   if (state?.mode === 'set_fsub') {
     userStates.delete(userId);
-    const ch = text.trim();
-    db.setSetting('fsub_channel', ch);
-    // ✅ FIX: Auto-fetch channel info after setting
-    const info = await getFsubChannelInfo();
-    let reply = `✅ Force subscribe channel set!\n\n`;
-    if (info && info.title !== ch) {
-      reply += `📢 Channel: <b>${esc(info.title)}</b>\n`;
-      if (info.username) reply += `🔗 ${esc(info.username)}\n`;
-      if (info.link) reply += `📎 ${esc(info.link)}\n`;
-    } else {
-      reply += `ID: <code>${esc(ch)}</code>`;
-    }
-    reply += `\n\n⚠️ Make sure the bot is an <b>admin</b> in that channel/group!`;
-    return bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
+    const chId = text.trim();
+    // Fetch channel info first
+    const info = await refreshFsubChannel(chId);
+    db.addFsubChannel(chId, info.title, info.link);
+    const reply =
+      `✅ <b>Channel Added!</b>\n\n` +
+      `📢 <b>${esc(info.title)}</b>\n` +
+      (info.link ? `🔗 ${esc(info.link)}\n` : '') +
+      `🆔 <code>${esc(chId)}</code>\n\n` +
+      `⚠️ Make sure the bot is an <b>admin</b> in this channel!`;
+    await bot.sendMessage(chatId, reply, { parse_mode: 'HTML', disable_web_page_preview: true });
+    return showFsubSettings(chatId, userId, msgId);
   }
 
   if (state?.mode === 'set_free_limit') {

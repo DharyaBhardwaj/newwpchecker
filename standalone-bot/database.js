@@ -66,6 +66,14 @@ db.exec(`
     ban_count    INTEGER DEFAULT 0
   );
 
+  CREATE TABLE IF NOT EXISTS fsub_channels (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT    NOT NULL UNIQUE,
+    title      TEXT,
+    link       TEXT,
+    added_at   TEXT    DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS refer_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     referrer_id INTEGER NOT NULL,
@@ -180,7 +188,30 @@ module.exports = {
 
   getRemainingChecks(telegramId, freeLimit, premiumLimit) {
     const u = db.prepare('SELECT is_premium, premium_until, daily_checks, daily_reset, bonus_checks FROM users WHERE telegram_id=?').get(telegramId);
-    if (!u) return { limit: freeLimit, used: 0, remaining: freeLimit, isPremium: false };
+    if (!u) return { limit: freeLimit, used: 0, remaining: freeLimit, isPremium: false ,
+
+  // ─── FSUB CHANNELS ────────────────────────────────────────────────────────
+
+  getAllFsubChannels() {
+    return db.prepare('SELECT * FROM fsub_channels ORDER BY id ASC').all();
+  },
+
+  addFsubChannel(channelId, title, link) {
+    return db.prepare(
+      'INSERT OR REPLACE INTO fsub_channels (channel_id, title, link) VALUES (?,?,?)'
+    ).run(channelId, title || channelId, link || '');
+  },
+
+  removeFsubChannel(channelId) {
+    return db.prepare('DELETE FROM fsub_channels WHERE channel_id=?').run(channelId);
+  },
+
+  updateFsubChannel(channelId, title, link) {
+    return db.prepare(
+      'UPDATE fsub_channels SET title=?, link=? WHERE channel_id=?'
+    ).run(title, link, channelId);
+  },
+};
     const today = new Date().toISOString().split('T')[0];
     const used = u.daily_reset === today ? (u.daily_checks || 0) : 0;
     const isPrem = u.is_premium && (!u.premium_until || new Date(u.premium_until) > new Date());
