@@ -713,15 +713,35 @@ async function checkForceSub(userId) {
 // Get fresh info for a single channel and save it to DB
 async function refreshFsubChannel(channelId) {
   try {
-    const chat = await bot.getChat(channelId);
-    let link = chat.invite_link || null;
-    if (!link && chat.username) link = `https://t.me/${chat.username}`;
-    if (!link) { try { link = await bot.exportChatInviteLink(channelId); } catch (_) {} }
+    const chat  = await bot.getChat(channelId);
     const title = chat.title || chat.username || channelId;
-    fsub.update(channelId, title, link || '');
+
+    // 1. Public channel — use @username link
+    let link = chat.username ? `https://t.me/${chat.username}` : null;
+
+    // 2. invite_link from Telegram (set by admins)
+    if (!link) link = chat.invite_link || null;
+
+    // 3. Try to generate invite link (only works if bot is admin)
+    if (!link) {
+      try { link = await bot.exportChatInviteLink(channelId); } catch (_) {}
+    }
+
+    // 4. Fallback: t.me/c/ID format (works for private channels without bot being admin)
+    if (!link) {
+      const numId = String(channelId).replace(/^-100/, '');
+      link = `https://t.me/c/${numId}/1`;
+    }
+
+    fsub.update(channelId, title, link);
     return { channel_id: channelId, title, link };
   } catch (_) {
-    return { channel_id: channelId, title: channelId, link: '' };
+    // Even if getChat fails, build a fallback link
+    const numId = String(channelId).replace(/^-100/, '');
+    const link  = String(channelId).startsWith('@')
+      ? `https://t.me/${channelId.replace('@','')}`
+      : `https://t.me/c/${numId}/1`;
+    return { channel_id: channelId, title: channelId, link };
   }
 }
 
