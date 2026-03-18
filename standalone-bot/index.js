@@ -1249,29 +1249,21 @@ async function showReferral(chatId, userId, msgId) {
 
 // ─── STATUS ───────────────────────────────────────────────────────────────
 async function showStatus(chatId, userId, msgId) {
-  const all = db.getAllAccounts();
-  let body  = '';
-  if (!all.length) {
-    body = 'No WhatsApp accounts configured.';
-  } else {
-    for (const a of all) {
-      const s   = accounts.get(a.account_id);
-      const st  = s?.status || (a.is_connected ? 'connected' : a.is_enabled ? 'disconnected' : 'banned');
-      const em  = { connected:'🟢', waiting_for_scan:'⏳', connecting:'🔄', banned:'🚫', disconnected:'🔴' }[st] || '🔴';
-      const ph  = a.phone_number ? `+${a.phone_number}` : 'Not linked';
-      const typ = a.account_type === 'backup' ? ' [backup]' : '';
-      body += `${em} <b>${esc(a.label||a.account_id)}</b>${typ}\n`;
-      body += `   📞 ${ph}\n\n`;
-    }
-  }
   const active = getConnectedCheckers().length;
-  return editMsg(chatId, msgId,
-    `📡 <b>System Status</b>\n` +
+  const isWorking = active > 0;
+
+  const text =
+    `📡 <b>Bot Status</b>\n` +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
-    `${body}` +
-    `<b>━━━━━━━━━━━━━━━━━━━━</b>\n` +
-    `✅ <b>Active checkers:</b> <code>${active}</code>`,
-    backBtn);
+    `${isWorking ? '🟢' : '🔴'} <b>${isWorking ? 'Online & Working' : 'Currently Offline'}</b>\n\n` +
+    `<i>${isWorking
+      ? '✅ Everything is working fine.\nYou can check numbers right now!'
+      : '⚠️ The bot is temporarily offline.\nPlease try again in a few minutes.'
+    }</i>\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `<b>🤖 WA Number Checker</b> — <i>by @Bhardwa_j</i>`;
+
+  return editMsg(chatId, msgId, text, backBtn);
 }
 
 // ─── HELP ─────────────────────────────────────────────────────────────────
