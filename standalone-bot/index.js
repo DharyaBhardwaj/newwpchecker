@@ -29,7 +29,7 @@ function applyEnvSettings() {
   // FSUB_CHANNELS: comma-separated channel IDs/usernames e.g. "@ch1,-100123456789"
   if (process.env.FSUB_CHANNELS) {
     const chs = process.env.FSUB_CHANNELS.split(',').map(s => s.trim()).filter(Boolean);
-    for (const ch of chs) db.addFsubChannel(ch, ch, '');
+    for (const ch of chs) fsub.add(ch, ch, '');
   }
   if (process.env.MENU_IMAGE)   db.setSetting('menu_image',   process.env.MENU_IMAGE);
 }
@@ -50,6 +50,21 @@ const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : (fs.existsSync('/var/data') ? '/var/data' : path.join(__dirname, 'data'));
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// ─── FSUB CHANNELS — inline SQLite (no database.js change needed) ─────────────
+const _fsubSqlite = new (require('better-sqlite3'))(path.join(DATA_DIR, 'bot.db'));
+_fsubSqlite.exec(`CREATE TABLE IF NOT EXISTS fsub_channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id TEXT NOT NULL UNIQUE,
+  title TEXT, link TEXT,
+  added_at TEXT DEFAULT CURRENT_TIMESTAMP
+);`);
+const fsub = {
+  getAll()               { return _fsubSqlite.prepare('SELECT * FROM fsub_channels ORDER BY id ASC').all(); },
+  add(id, title, link)   { return _fsubSqlite.prepare('INSERT OR REPLACE INTO fsub_channels (channel_id,title,link) VALUES (?,?,?)').run(id, title||id, link||''); },
+  remove(id)             { return _fsubSqlite.prepare('DELETE FROM fsub_channels WHERE channel_id=?').run(id); },
+  update(id, title, link){ return _fsubSqlite.prepare('UPDATE fsub_channels SET title=?,link=? WHERE channel_id=?').run(title, link, id); },
+};
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -682,7 +697,7 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 // ─── FSUB: check if user has joined ALL required channels ────────────────
 async function checkForceSub(userId) {
   if (isAdmin(userId)) return true;
-  const channels = db.getAllFsubChannels();
+  const channels = fsub.getAll();
   if (!channels.length) return true;
   for (const ch of channels) {
     try {
@@ -703,7 +718,7 @@ async function refreshFsubChannel(channelId) {
     if (!link && chat.username) link = `https://t.me/${chat.username}`;
     if (!link) { try { link = await bot.exportChatInviteLink(channelId); } catch (_) {} }
     const title = chat.title || chat.username || channelId;
-    db.updateFsubChannel(channelId, title, link || '');
+    fsub.update(channelId, title, link || '');
     return { channel_id: channelId, title, link };
   } catch (_) {
     return { channel_id: channelId, title: channelId, link: '' };
@@ -713,7 +728,7 @@ async function refreshFsubChannel(channelId) {
 // Get channels user has NOT joined yet
 async function getMissingChannels(userId) {
   if (isAdmin(userId)) return [];
-  const channels = db.getAllFsubChannels();
+  const channels = fsub.getAll();
   const missing = [];
   for (const ch of channels) {
     try {
@@ -730,7 +745,7 @@ async function getMissingChannels(userId) {
 async function sendFsubPrompt(chatId, userId) {
   const missing  = await getMissingChannels(userId);
   const fsubImg  = db.getSetting('fsub_image') || null;
-  const total    = db.getAllFsubChannels().length;
+  const total    = fsub.getAll().length;
   const doneCount = total - missing.length;
 
   let body =
@@ -798,7 +813,7 @@ bot.on('callback_query', async query => {
   if (data.startsWith('fsub_del_')) {
     if (!isAdmin(userId)) return;
     const chId = data.replace('fsub_del_', '');
-    db.removeFsubChannel(chId);
+    fsub.remove(chId);
     return showFsubSettings(chatId, userId, msgId);
   }
   if (data.startsWith('wa_qr_'))         return handleWaQR(chatId, userId, msgId, data.replace('wa_qr_',''));
@@ -1679,7 +1694,7 @@ async function startBroadcast(chatId, userId, msgId) {
 // ✅ FIX: Shows channel name and invite link automatically
 async function showFsubSettings(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
-  const channels = db.getAllFsubChannels();
+  const channels = fsub.getAll();
   const fsubImg  = db.getSetting('fsub_image') || null;
 
   let body =
@@ -2056,7 +2071,7 @@ bot.on('message', async msg => {
     const chId = text.trim();
     // Fetch channel info first
     const info = await refreshFsubChannel(chId);
-    db.addFsubChannel(chId, info.title, info.link);
+    fsub.add(chId, info.title, info.link);
     const reply =
       `✅ <b>Channel Added!</b>\n\n` +
       `📢 <b>${esc(info.title)}</b>\n` +
