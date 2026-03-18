@@ -952,14 +952,7 @@ async function editMsg(chatId, msgId, text, markup) {
   }).catch(() => null);
   if (asCaption) return asCaption;
 
-  // 3. Replace photo with a plain text message using editMessageMedia
-  const asMedia = await bot.editMessageMedia(
-    { type: 'photo', media: 'https://i.imgur.com/remove.png', caption: text, parse_mode: 'HTML' },
-    { chat_id: chatId, message_id: msgId, reply_markup: markup }
-  ).catch(() => null);
-  if (asMedia) return asMedia;
-
-  // 4. Last resort — delete old and send fresh (ONLY if all edits fail)
+  // 3. Last resort — delete the photo message and send fresh text
   await bot.deleteMessage(chatId, msgId).catch(() => {});
   return bot.sendMessage(chatId, text, {
     parse_mode:               'HTML',
