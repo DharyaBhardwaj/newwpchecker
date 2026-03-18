@@ -741,29 +741,56 @@ async function getMissingChannels(userId) {
   return missing;
 }
 
-// ─── FSUB PROMPT — shows all channels user must join ─────────────────────
+// ─── FSUB PROMPT — shows ALL channels with joined/not status ─────────────
 async function sendFsubPrompt(chatId, userId) {
-  const missing  = await getMissingChannels(userId);
-  const fsubImg  = db.getSetting('fsub_image') || null;
-  const total    = fsub.getAll().length;
-  const doneCount = total - missing.length;
+  const allChannels = fsub.getAll();
+  const fsubImg     = db.getSetting('fsub_image') || null;
+
+  // Refresh names/links from Telegram (async, don't block)
+  for (const ch of allChannels) {
+    if (!ch.title || ch.title === ch.channel_id) {
+      await refreshFsubChannel(ch.channel_id).catch(() => {});
+    }
+  }
+
+  // Re-fetch after refresh
+  const channels = fsub.getAll();
+
+  // Check join status for each channel
+  const statuses = await Promise.all(channels.map(async ch => {
+    try {
+      const m = await bot.getChatMember(ch.channel_id, userId);
+      return { ...ch, joined: ['member','administrator','creator'].includes(m.status) };
+    } catch (_) {
+      return { ...ch, joined: false };
+    }
+  }));
+
+  const joined  = statuses.filter(c => c.joined).length;
+  const total   = statuses.length;
+  const missing = statuses.filter(c => !c.joined);
 
   let body =
     `🔐 <b>Access Restricted</b>\n` +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
-    `To use <b>WA Number Checker</b>, you must\n` +
-    `join <b>all</b> required channels.\n\n` +
-    `<b>📋 Progress: ${doneCount}/${total} joined</b>\n\n`;
+    `To use <b>WA Number Checker</b> you must\n` +
+    `join <b>all</b> channels below.\n\n` +
+    `<b>📊 Progress: ${joined}/${total} joined</b>\n\n`;
 
+  // Show ALL channels with status
   const kb = [];
-  for (const ch of missing) {
-    const link = ch.link || `https://t.me/${ch.channel_id.replace('@','')}`;
-    body += `❌ <a href="${esc(link)}">${esc(ch.title || ch.channel_id)}</a>\n`;
-    kb.push([{ text: `📢 Join — ${esc(ch.title || ch.channel_id)}`, url: link }]);
+  for (const ch of statuses) {
+    const link  = ch.link || `https://t.me/${ch.channel_id.replace('@','')}`;
+    const name  = ch.title && ch.title !== ch.channel_id ? ch.title : ch.channel_id;
+    const icon  = ch.joined ? '✅' : '❌';
+    body += `${icon} <a href="${esc(link)}"><b>${esc(name)}</b></a>\n`;
+    if (!ch.joined) {
+      kb.push([{ text: `➕ Join ${esc(name)}`, url: link }]);
+    }
   }
 
-  body += `\n<i>Join all channels above, then tap the button below.</i>`;
-  kb.push([{ text: '✅ I have joined all — Verify', callback_data: 'fsub_verify' }]);
+  body += `\n<i>Join all ❌ channels, then tap Verify below.</i>`;
+  kb.push([{ text: '🔄 Verify — Check Again', callback_data: 'fsub_verify' }]);
 
   if (fsubImg) {
     return bot.sendPhoto(chatId, fsubImg, {
@@ -771,10 +798,18 @@ async function sendFsubPrompt(chatId, userId) {
       parse_mode:   'HTML',
       reply_markup: { inline_keyboard: kb },
     }).catch(() =>
-      bot.sendMessage(chatId, body, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb }, disable_web_page_preview: true })
+      bot.sendMessage(chatId, body, {
+        parse_mode:              'HTML',
+        reply_markup:            { inline_keyboard: kb },
+        disable_web_page_preview: true,
+      })
     );
   }
-  return bot.sendMessage(chatId, body, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb }, disable_web_page_preview: true });
+  return bot.sendMessage(chatId, body, {
+    parse_mode:              'HTML',
+    reply_markup:            { inline_keyboard: kb },
+    disable_web_page_preview: true,
+  });
 }
 
 // ─── CALLBACK ROUTER ──────────────────────────────────────────────────────
@@ -1813,19 +1848,55 @@ async function handleFsubVerify(query) {
   const userId  = query.from.id;
   const chatId  = query.message.chat.id;
   const msgId   = query.message.message_id;
+
+  await bot.answerCallbackQuery(query.id, { text: '🔄 Checking...' }).catch(() => {});
+
   const missing = await getMissingChannels(userId);
 
   if (missing.length === 0) {
+    // All joined — show welcome
     userStates.delete(userId);
-    await bot.answerCallbackQuery(query.id, { text: '✅ All channels joined! Access granted.', show_alert: false }).catch(() => {});
     return editMsg(chatId, msgId, welcomeText(userId), mainMenu(userId));
   }
 
-  const names = missing.map(c => c.title || c.channel_id).join(', ');
+  // Still missing some — update the prompt in-place
+  const names = missing.map(c => c.title && c.title !== c.channel_id ? c.title : c.channel_id).join(', ');
   await bot.answerCallbackQuery(query.id, {
     text: `❌ Still need to join: ${names}`,
     show_alert: true,
   }).catch(() => {});
+
+  // Rebuild prompt with updated statuses in same message
+  const allChannels = fsub.getAll();
+  const statuses = await Promise.all(allChannels.map(async ch => {
+    try {
+      const m = await bot.getChatMember(ch.channel_id, userId);
+      return { ...ch, joined: ['member','administrator','creator'].includes(m.status) };
+    } catch (_) { return { ...ch, joined: false }; }
+  }));
+
+  const joined = statuses.filter(c => c.joined).length;
+  const total  = statuses.length;
+
+  let body =
+    `🔐 <b>Access Restricted</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `To use <b>WA Number Checker</b> you must\n` +
+    `join <b>all</b> channels below.\n\n` +
+    `<b>📊 Progress: ${joined}/${total} joined</b>\n\n`;
+
+  const kb = [];
+  for (const ch of statuses) {
+    const link = ch.link || `https://t.me/${ch.channel_id.replace('@','')}`;
+    const name = ch.title && ch.title !== ch.channel_id ? ch.title : ch.channel_id;
+    body += `${ch.joined ? '✅' : '❌'} <a href="${esc(link)}"><b>${esc(name)}</b></a>\n`;
+    if (!ch.joined) kb.push([{ text: `➕ Join ${esc(name)}`, url: link }]);
+  }
+
+  body += `\n<i>Join all ❌ channels, then tap Verify below.</i>`;
+  kb.push([{ text: '🔄 Verify — Check Again', callback_data: 'fsub_verify' }]);
+
+  return editMsg(chatId, msgId, body, { inline_keyboard: kb });
 }
 
 // ─── GET / CHANGE NUMBER ─────────────────────────────────────────────────
@@ -2424,6 +2495,11 @@ const PORT = config.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
   applyEnvSettings();
+  // Refresh channel names/links from Telegram on every boot
+  const _allChs = fsub.getAll();
+  for (const ch of _allChs) {
+    await refreshFsubChannel(ch.channel_id).catch(() => {});
+  }
   await connectAllSaved();
   console.log('✅ WhatsApp Number Checker Bot started!');
 });
