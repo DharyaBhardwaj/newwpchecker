@@ -929,35 +929,23 @@ bot.on('callback_query', async query => {
 });
 
 // ─── EDIT MESSAGE HELPER ──────────────────────────────────────────────────
-// Smart edit: handles text messages, photo captions, and replaces photos with text
 async function editMsg(chatId, msgId, text, markup) {
-  const opts = {
+  // Try as text message first
+  const ok = await bot.editMessageText(text, {
     chat_id:                  chatId,
     message_id:               msgId,
     parse_mode:               'HTML',
     reply_markup:             markup,
     disable_web_page_preview: true,
-  };
+  }).catch(() => null);
+  if (ok) return ok;
 
-  // 1. Try editing as plain text message
-  const asText = await bot.editMessageText(text, opts).catch(() => null);
-  if (asText) return asText;
-
-  // 2. Message is a photo — edit its caption
-  const asCaption = await bot.editMessageCaption(text, {
+  // Message is a photo — edit only the caption + keyboard, never delete
+  return bot.editMessageCaption(text, {
     chat_id:      chatId,
     message_id:   msgId,
     parse_mode:   'HTML',
     reply_markup: markup,
-  }).catch(() => null);
-  if (asCaption) return asCaption;
-
-  // 3. Last resort — delete the photo message and send fresh text
-  await bot.deleteMessage(chatId, msgId).catch(() => {});
-  return bot.sendMessage(chatId, text, {
-    parse_mode:               'HTML',
-    reply_markup:             markup,
-    disable_web_page_preview: true,
   }).catch(() => {});
 }
 
@@ -967,14 +955,16 @@ async function sendWelcome(chatId, userId) {
   const text = welcomeText(userId);
   const kb   = mainMenu(userId);
   if (img) {
-    // sendPhoto only — no fallback that could send a second message
     return bot.sendPhoto(chatId, img, {
       caption:      text,
       parse_mode:   'HTML',
       reply_markup: kb,
-    }).catch(async () => {
-      // Image broken/invalid — clear it and send text instead (no double message)
+    }).catch(() => {
+      // Photo invalid — clear setting, fall through to text
       db.setSetting('menu_image', '');
+    }).then(sent => {
+      // If photo sent successfully, return; otherwise send text
+      if (sent) return sent;
       return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
     });
   }
