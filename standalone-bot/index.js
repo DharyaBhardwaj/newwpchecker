@@ -3136,9 +3136,62 @@ bot.onText(/\/remprem (\d+)/, (msg, match) => {
 });
 bot.onText(/\/user (\d+)/, async (msg, match) => {
   if (!isAdmin(msg.from.id)) return;
+  markMsg(msg.message_id);
   const targetId = parseInt(match[1]);
-  // Use full handleUserInfo with all buttons
-  await handleUserInfo(msg.chat.id, msg.from.id, null, targetId);
+  const u = db.getUser(targetId);
+  if (!u) return bot.sendMessage(msg.chat.id, `❌ User not found: <code>${targetId}</code>`, { parse_mode: 'HTML' });
+
+  const prem   = db.isPremiumActive(targetId);
+  const isVipU = prem && u.premium_plan === 'vip';
+  const role   = u.role === 'owner' ? '👑 Owner' : u.role === 'admin' ? '⭐ Admin' : '👤 User';
+  const premTxt = prem ? (u.premium_until ? `✅ ${isVipU ? 'VIP' : 'Premium'} until ${new Date(u.premium_until).toLocaleDateString()}` : `✅ ${isVipU ? 'VIP' : 'Premium'} Lifetime`) : '❌ None';
+  const today  = new Date().toISOString().split('T')[0];
+  const used   = u.daily_reset === today ? (u.daily_checks || 0) : 0;
+
+  const banRow   = u.is_blocked
+    ? [{ text: '✅ Unban User', callback_data: `user_unban_${targetId}` }]
+    : [{ text: '🚫 Ban User',   callback_data: `user_ban_${targetId}` }];
+
+  const premRow  = prem
+    ? [{ text: `${isVipU?'👑':'💎'} Remove`, callback_data: `user_remprem_${targetId}` },
+       { text: isVipU ? '💎 To Premium' : '👑 To VIP', callback_data: isVipU ? `user_prem30_${targetId}` : `user_vip30_${targetId}` }]
+    : [{ text: '💎 +30d Prem',  callback_data: `user_prem30_${targetId}` },
+       { text: '♾ Prem Life',   callback_data: `user_premlife_${targetId}` }];
+
+  const vipRow   = !prem
+    ? [{ text: '👑 +30d VIP', callback_data: `user_vip30_${targetId}` },
+       { text: '♾ VIP Life',  callback_data: `user_viplife_${targetId}` }]
+    : [];
+
+  const bonusRow  = [
+    { text: '🎟 +100',  callback_data: `user_bonus_100_${targetId}` },
+    { text: '🎟 +500',  callback_data: `user_bonus_500_${targetId}` },
+    { text: '🎟 +1000', callback_data: `user_bonus_1000_${targetId}` },
+  ];
+  const bonusRow2 = [
+    { text: '🎟 +5000',         callback_data: `user_bonus_5000_${targetId}` },
+    { text: '❌ Remove Checks', callback_data: `user_clrbonus_${targetId}` },
+  ];
+  const roleRow  = u.role === 'admin'
+    ? [{ text: '⬇️ Demote', callback_data: `user_demote_${targetId}` }]
+    : [{ text: '⬆️ Promote to Admin', callback_data: `user_promote_${targetId}` }];
+
+  const rows = [banRow, premRow];
+  if (vipRow.length) rows.push(vipRow);
+  rows.push(bonusRow, bonusRow2, roleRow);
+
+  await bot.sendMessage(msg.chat.id,
+    `👤 <b>User Details</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `🆔 <b>ID:</b> <code>${targetId}</code>\n` +
+    `📛 <b>Username:</b> @${esc(u.username)||'N/A'}\n` +
+    `🎭 <b>Role:</b> ${role}\n\n` +
+    `<b>💎 Premium:</b> ${premTxt}\n` +
+    `<b>🚫 Banned:</b> ${u.is_blocked ? 'Yes' : 'No'}\n\n` +
+    `<b>📊 Stats:</b>\n` +
+    `  ├ Total: <b>${fmt(u.numbers_checked)}</b>\n` +
+    `  ├ Today: <b>${used}</b>\n` +
+    `  └ Bonus: <b>${u.bonus_checks || 0}</b>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
