@@ -129,13 +129,16 @@ module.exports = {
 
   getRemainingChecks(telegramId, freeLimit, premiumLimit) {
     const u = _users.get(telegramId);
-    if (!u) return { limit: freeLimit, used: 0, remaining: freeLimit, isPremium: false };
-    const today = new Date().toISOString().split('T')[0];
-    const used  = u.daily_reset === today ? (u.daily_checks || 0) : 0;
-    const prem  = isPremActive(u);
-    const limit = prem ? premiumLimit : freeLimit;
-    const bonus = u.bonus_checks || 0;
-    return { limit, used, remaining: Math.max(0, limit + bonus - used), isPremium: prem };
+    if (!u) return { limit: freeLimit, used: 0, remaining: freeLimit, isPremium: false, isVip: false };
+    const today  = new Date().toISOString().split('T')[0];
+    const used   = u.daily_reset === today ? (u.daily_checks || 0) : 0;
+    const prem   = isPremActive(u);
+    const isVip  = prem && u.premium_plan === 'vip';
+    const bonus  = u.bonus_checks || 0;
+    // VIP = unlimited (999999)
+    const limit  = isVip ? 999999 : (prem ? premiumLimit : freeLimit);
+    const remaining = isVip ? 999999 : Math.max(0, limit + bonus - used);
+    return { limit, used, remaining, isPremium: prem, isVip, bonus };
   },
 
   incrementDailyChecks(telegramId, count) {

@@ -595,6 +595,12 @@ function isPremium(userId) {
   return db.isPremiumActive(userId);
 }
 
+function isVip(userId) {
+  if (isAdmin(userId)) return true;
+  const u = db.getUser(userId);
+  return db.isPremiumActive(userId) && u?.premium_plan === 'vip';
+}
+
 function isMaintenanceMode() {
   return db.getSetting('maintenance') === 'on';
 }
@@ -890,7 +896,7 @@ bot.on('callback_query', async query => {
   if (data.startsWith('user_promote_'))  return handleUserRole(chatId, userId, msgId, parseInt(data.replace('user_promote_','')), 'admin');
   if (data.startsWith('user_demote_'))   return handleUserRole(chatId, userId, msgId, parseInt(data.replace('user_demote_','')), 'user');
   if (data.startsWith('user_remprem_'))  return handleRemovePremium(chatId, userId, msgId, parseInt(data.replace('user_remprem_','')));
-  if (data.startsWith('user_prem30_'))   return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_prem30_','')), 30);
+  if (data.startsWith('user_prem30_'))   return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_prem30_','')), 30, 'premium');
   if (data.startsWith('user_bonus_')) {
     if (!isAdmin(userId)) return;
     const parts    = data.replace('user_bonus_', '').split('_');
@@ -898,7 +904,10 @@ bot.on('callback_query', async query => {
     const targetId = parseInt(parts[1]);
     return handleAddBonusChecks(chatId, userId, msgId, targetId, checks);
   }
-  if (data.startsWith('user_premlife_')) return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_premlife_','')), 'lifetime');
+  if (data.startsWith('user_premlife_')) return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_premlife_','')), 'lifetime', 'premium');
+  if (data.startsWith('user_vip30_'))    return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_vip30_','')), 30, 'vip');
+  if (data.startsWith('user_viplife_'))  return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_viplife_','')), 'lifetime', 'vip');
+  if (data.startsWith('user_clrbonus_')) return handleClearBonus(chatId, userId, msgId, parseInt(data.replace('user_clrbonus_','')));
 
   switch (data) {
     case 'main_menu':    return showMainMenu(chatId, userId, msgId);
@@ -1012,6 +1021,16 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'set_refer_bonus' });
       return editMsg(chatId, msgId, `⚙️ <b>Set Referral Bonus Checks</b>\n\nCurrent: <code>${db.getSetting('refer_bonus') || 10}</code>\n\nSend new value:`, backBtn);
+
+    case 'set_vip_limit':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_vip_limit' });
+      return editMsg(chatId, msgId, `👑 <b>VIP Daily Limit</b>\n\nCurrent: <code>${db.getSetting('vip_limit') || 'Unlimited'}</code>\n\nSend number or <code>unlimited</code>:`, backBtn);
+
+    case 'set_vip_bulk':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_vip_bulk' });
+      return editMsg(chatId, msgId, `👑 <b>VIP Bulk Limit</b>\n\nCurrent: <code>${db.getSetting('vip_bulk') || '1000'}</code>\n\nSend max numbers per request:`, backBtn);
 
     case 'set_upi_id':
       if (!isAdmin(userId)) return;
@@ -1173,9 +1192,11 @@ async function showCheckNumber(chatId, userId, msgId) {
 async function showBulkCheck(chatId, userId, msgId) {
   const freeLimit = parseInt(db.getSetting('free_limit') || '20');
   const premLimit = parseInt(db.getSetting('prem_limit') || '500');
-  const bulkLimit = parseInt(db.getSetting('bulk_limit') || '100');
+  const vipBulk   = parseInt(db.getSetting('vip_bulk')   || '1000');
+  const bulkLimit = isVip(userId) ? vipBulk : parseInt(db.getSetting('bulk_limit') || '100');
   const isPrem    = isPremium(userId);
-  const myLimit   = isPrem ? premLimit : freeLimit;
+  const vipUser   = isVip(userId);
+  const myLimit   = vipUser ? 999999 : (isPrem ? premLimit : freeLimit);
   const limits    = db.getRemainingChecks(userId, freeLimit, premLimit);
   userStates.set(userId, { mode: 'bulk_check' });
   return editMsg(chatId, msgId,
@@ -1186,7 +1207,7 @@ async function showBulkCheck(chatId, userId, msgId) {
     `  • Daily limit: <code>${myLimit}</code> checks\n` +
     `  • Remaining today: <code>${limits.remaining}</code>\n` +
     `  • Per request max: <code>${bulkLimit}</code>\n` +
-    `  • Tier: ${isPrem ? '<b>💎 Premium</b>' : '<b>👤 Free</b>'}\n\n` +
+    `  • Tier: ${vipUser ? '<b>👑 VIP</b>' : isPrem ? '<b>💎 Premium</b>' : '<b>👤 Free</b>'}\n\n` +
     `<i>Results for large batches (50+) are sent\nas downloadable .txt files.</i>`,
     backBtn);
 }
@@ -1264,17 +1285,17 @@ async function showPremiumInfo(chatId, userId, msgId) {
       const diff = Math.ceil((d - new Date()) / 86400000);
       expText = `⏳ <b>${diff} day(s) remaining</b>\n📅 Renews: ${d.toLocaleDateString('en-IN')}`;
     }
-    const plan = u.premium_plan || 'Premium';
+    const plan    = u.premium_plan === 'vip' ? '👑 VIP' : '💎 Premium';
+    const isVipPl  = u.premium_plan === 'vip';
     return editMsg(chatId, msgId,
       `💎 <b>Your Plan: ${esc(plan)}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n\n` +
       `${expText}\n\n` +
       `<b>✨ Active Benefits:</b>\n` +
-      `  ✅ ${db.getSetting('prem_limit') || '500'} checks / day\n` +
-      `  ✅ Bulk up to ${db.getSetting('bulk_limit') || '100'} numbers\n` +
-      `  ✅ Priority processing\n` +
-      `  ✅ Premium support\n\n` +
-      `<i>Thank you for supporting us! 🙏</i>`,
+      (isVipPl
+        ? `  ✅ <b>Unlimited</b> checks / day\n  ✅ Bulk up to <b>${db.getSetting('vip_bulk') || '1000'}</b> numbers\n  ✅ Top priority\n  ✅ VIP support`
+        : `  ✅ <b>${db.getSetting('prem_limit') || '500'}</b> checks / day\n  ✅ Bulk up to <b>${db.getSetting('bulk_limit') || '100'}</b> numbers\n  ✅ Priority processing\n  ✅ Premium support`) +
+      `\n\n<i>Thank you for supporting us! 🙏</i>`,
       { inline_keyboard: [
         [{ text: '🔄 Upgrade / Renew', callback_data: 'premium_plans' }],
         [{ text: '‹ Back to Menu',     callback_data: 'main_menu' }],
@@ -1782,22 +1803,35 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
     ? [{ text: '✅ Unban User', callback_data: `user_unban_${targetId}` }]
     : [{ text: '🚫 Ban User',   callback_data: `user_ban_${targetId}` }];
 
-  // Row 2: Premium — add 30d / add lifetime / remove
+  const uObj   = db.getUser(targetId);
+  const isVipU = db.isPremiumActive(targetId) && uObj?.premium_plan === 'vip';
+
+  // Row 2: Premium
   const premRow = prem
-    ? [{ text: '❌ Remove Premium', callback_data: `user_remprem_${targetId}` }]
+    ? [
+        { text: `${isVipU ? '👑 VIP' : '💎 Prem'} — Remove`, callback_data: `user_remprem_${targetId}` },
+        { text: isVipU ? '💎 Switch to Prem' : '👑 Switch to VIP', callback_data: isVipU ? `user_prem30_${targetId}` : `user_vip30_${targetId}` },
+      ]
     : [
-        { text: '💎 +30 Days',   callback_data: `user_prem30_${targetId}` },
-        { text: '♾ Lifetime',    callback_data: `user_premlife_${targetId}` },
+        { text: '💎 +30 Days',  callback_data: `user_prem30_${targetId}` },
+        { text: '♾ Prem Life', callback_data: `user_premlife_${targetId}` },
       ];
 
+  // Row 2b: VIP add (only when not already premium)
+  const vipRow = !prem ? [
+    { text: '👑 +30 Days VIP',  callback_data: `user_vip30_${targetId}` },
+    { text: '♾ VIP Lifetime',  callback_data: `user_viplife_${targetId}` },
+  ] : [];
+
   // Row 3: Bonus checks
-  const bonusRow = [
-    { text: '🎟 +100 checks',  callback_data: `user_bonus_100_${targetId}` },
-    { text: '🎟 +500 checks',  callback_data: `user_bonus_500_${targetId}` },
+  const bonusRow  = [
+    { text: '🎟 +100',  callback_data: `user_bonus_100_${targetId}` },
+    { text: '🎟 +500',  callback_data: `user_bonus_500_${targetId}` },
+    { text: '🎟 +1000', callback_data: `user_bonus_1000_${targetId}` },
   ];
   const bonusRow2 = [
-    { text: '🎟 +1000 checks', callback_data: `user_bonus_1000_${targetId}` },
-    { text: '🎟 +5000 checks', callback_data: `user_bonus_5000_${targetId}` },
+    { text: '🎟 +5000',          callback_data: `user_bonus_5000_${targetId}` },
+    { text: '❌ Remove Checks',  callback_data: `user_clrbonus_${targetId}` },
   ];
 
   // Row 4: Role
@@ -1805,14 +1839,12 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
     ? [{ text: '⬇️ Demote to User',   callback_data: `user_demote_${targetId}` }]
     : [{ text: '⬆️ Promote to Admin', callback_data: `user_promote_${targetId}` }];
 
-  const kb = { inline_keyboard: [
-    banRow,
-    premRow,
-    bonusRow,
-    bonusRow2,
-    roleRow,
-    [{ text: '‹ Back to Users', callback_data: 'op_users' }],
-  ]};
+  const rows = [banRow, premRow];
+  if (vipRow.length) rows.push(vipRow);
+  rows.push(bonusRow, bonusRow2, roleRow);
+  rows.push([{ text: '‹ Back to Users', callback_data: 'op_users' }]);
+
+  const kb = { inline_keyboard: rows };
 
   const today = new Date().toISOString().split('T')[0];
   const dailyUsed = u.daily_reset === today ? (u.daily_checks || 0) : 0;
@@ -1869,6 +1901,20 @@ async function handleUserRole(chatId, adminId, msgId, targetId, role) {
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
+async function handleClearBonus(chatId, adminId, msgId, targetId) {
+  if (!isAdmin(adminId)) return;
+  if (supabase) {
+    await supabase.from('users').update({ bonus_checks: 0 }).eq('telegram_id', targetId).catch(() => {});
+    const u = db.getUser(targetId);
+    if (u) u.bonus_checks = 0;
+  }
+  sendLog(`🎟 <b>Bonus Checks Cleared</b>\n🆔 <code>${targetId}</code>\nBy: <code>${adminId}</code>`);
+  bot.sendMessage(targetId,
+    `ℹ️ Your bonus checks balance has been reset to 0.`,
+    { parse_mode: 'HTML' }).catch(() => {});
+  return handleUserInfo(chatId, adminId, msgId, targetId);
+}
+
 async function handleRemovePremium(chatId, adminId, msgId, targetId) {
   if (!isAdmin(adminId)) return;
   db.removePremium(targetId);
@@ -1916,7 +1962,7 @@ async function handleAddBonusChecks(chatId, adminId, msgId, targetId, checks) {
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
-async function handleAddPremium(chatId, adminId, msgId, targetId, days) {
+async function handleAddPremium(chatId, adminId, msgId, targetId, days, plan = 'premium') {
   if (!isAdmin(adminId)) return;
   let until = null;
   if (days !== 'lifetime') {
@@ -1925,14 +1971,33 @@ async function handleAddPremium(chatId, adminId, msgId, targetId, days) {
   }
   db.createUser(targetId, '', '', 'user');
   db.setPremium(targetId, until);
-  const expTxt = until ? `until ${until.toLocaleDateString()}` : 'Lifetime';
+
+  // Save plan type
+  if (supabase) {
+    await supabase.from('users').update({ premium_plan: plan }).eq('telegram_id', targetId).catch(() => {});
+  }
+  const u = db.getUser(targetId);
+  if (u) u.premium_plan = plan;
+
+  const isVipPlan = plan === 'vip';
+  const expTxt    = until ? `until ${until.toLocaleDateString()}` : 'Lifetime';
+  const planLabel = isVipPlan ? '👑 VIP' : '💎 Premium';
+  const vipDaily  = db.getSetting('vip_limit') || 'Unlimited';
+  const vipBulk   = db.getSetting('vip_bulk')  || '1000';
+  const premDaily = db.getSetting('prem_limit') || '500';
+  const premBulk  = db.getSetting('bulk_limit') || '100';
+
   bot.sendMessage(targetId,
-    `💎 <b>Premium Activated!</b>\n\n` +
-    `${until ? `Active until <b>${until.toLocaleDateString()}</b>` : '✨ You have <b>Lifetime Premium</b>!'}\n\n` +
-    `Enjoy your benefits! 🎉`,
-    { parse_mode: 'HTML' }
-  ).catch(() => {});
-  sendLog(`💎 <b>Premium Added</b>\n🆔 <code>${targetId}</code>\n⏳ ${expTxt}\nBy: <code>${adminId}</code>`);
+    `${isVipPlan ? '👑' : '💎'} <b>${planLabel} Activated!</b>\n\n` +
+    `${until ? `Active until <b>${until.toLocaleDateString()}</b>` : `✨ <b>Lifetime ${planLabel}!</b>`}\n\n` +
+    `<b>✨ Your Benefits:</b>\n` +
+    (isVipPlan
+      ? `  ✅ <b>Unlimited</b> checks/day\n  ✅ Bulk up to <b>${vipBulk}</b> numbers\n  ✅ Top priority processing\n  ✅ VIP support`
+      : `  ✅ <b>${premDaily}</b> checks/day\n  ✅ Bulk up to <b>${premBulk}</b> numbers\n  ✅ Priority processing`) +
+    `\n\nEnjoy your benefits! 🎉`,
+    { parse_mode: 'HTML' }).catch(() => {});
+
+  sendLog(`${isVipPlan ? '👑' : '💎'} <b>${planLabel} Added</b>\n🆔 <code>${targetId}</code>\n⏳ ${expTxt}\nBy: <code>${adminId}</code>`);
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
@@ -2036,6 +2101,8 @@ async function showBotSettings(chatId, userId, msgId) {
     `💎 <b>Premium limit:</b> <code>${premL}/day</code>\n` +
     `📁 <b>Bulk limit:</b> <code>${bulkL}</code>\n` +
     `🔗 <b>Refer bonus:</b> <code>${refB} checks</code>\n` +
+    `\n👑 <b>VIP Daily:</b> <code>${db.getSetting('vip_limit') || 'Unlimited'}</code>\n` +
+    `👑 <b>VIP Bulk:</b>  <code>${db.getSetting('vip_bulk') || '1000'}</code>\n` +
     `🖼 <b>Menu image:</b> ${menuImg ? '✅ Set' : '❌ Not set'}\n` +
     `💳 <b>UPI ID:</b> <code>${db.getSetting('upi_id') || 'Not set'}</code>`,
     { inline_keyboard: [
@@ -2050,6 +2117,8 @@ async function showBotSettings(chatId, userId, msgId) {
       [{ text: '📁 Bulk Limit', callback_data:'set_bulk_limit' },
        { text: '🔗 Refer Bonus', callback_data:'set_refer_bonus' }],
       [{ text: '💳 Set UPI ID', callback_data: 'set_upi_id' }],
+      [{ text: '👑 VIP Daily Limit', callback_data: 'set_vip_limit' },
+       { text: '👑 VIP Bulk Limit',  callback_data: 'set_vip_bulk' }],
       [{ text: menuImg ? '🖼 Change Menu Image' : '🖼 Set Menu Image', callback_data: 'set_menu_image' },
        menuImg ? { text: '🗑 Remove Menu Image', callback_data: 'menu_img_remove' } : { text: '‹ Back', callback_data: 'owner_panel' }],
       menuImg ? [{ text: '‹ Back', callback_data: 'owner_panel' }] : [],
@@ -2598,6 +2667,21 @@ bot.on('message', async msg => {
     return bot.sendMessage(chatId, `✅ Referral bonus set to <b>${v} checks</b>`, { parse_mode: 'HTML' });
   }
 
+  if (state?.mode === 'set_vip_limit') {
+    userStates.delete(userId);
+    const val = text.trim().toLowerCase();
+    db.setSetting('vip_limit', val === 'unlimited' ? '999999' : String(parseInt(val) || 999999));
+    return bot.sendMessage(chatId, `✅ VIP daily limit set to <b>${val}</b>`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'set_vip_bulk') {
+    userStates.delete(userId);
+    const v = parseInt(text.trim());
+    if (isNaN(v) || v < 1) return bot.sendMessage(chatId, '❌ Invalid number.');
+    db.setSetting('vip_bulk', String(v));
+    return bot.sendMessage(chatId, `✅ VIP bulk limit set to <b>${v}</b>`, { parse_mode: 'HTML' });
+  }
+
   if (state?.mode === 'set_upi_id') {
     userStates.delete(userId);
     db.setSetting('upi_id', text.trim());
@@ -2699,7 +2783,8 @@ bot.on('message', async msg => {
 
   const freeLimit = parseInt(db.getSetting('free_limit') || '20');
   const premLimit = parseInt(db.getSetting('prem_limit') || '500');
-  const bulk      = parseInt(db.getSetting('bulk_limit') || '100');
+  const vipBulkL  = parseInt(db.getSetting('vip_bulk')   || '1000');
+  const bulk      = isVip(userId) ? vipBulkL : parseInt(db.getSetting('bulk_limit') || '100');
   const limits    = db.getRemainingChecks(userId, freeLimit, premLimit);
 
   if (limits.remaining <= 0) {
