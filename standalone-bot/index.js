@@ -392,6 +392,17 @@ async function checkNumber(accountId, phone) {
 }
 
 // ─── LOAD-BALANCED BULK CHECK ─────────────────────────────────────────────
+async function checkSingleNumber(accountId, phone) {
+  const acct = accounts.get(accountId);
+  if (!acct?.sock) return { phone_number: phone, is_registered: null };
+  try {
+    const [result] = await acct.sock.onWhatsApp(phone);
+    return { phone_number: phone, is_registered: result?.exists ?? false };
+  } catch (e) {
+    return { phone_number: phone, is_registered: null, error: e.message };
+  }
+}
+
 async function bulkCheck(numbers, onProgress) {
   const results = new Array(numbers.length).fill(null);
   let pending   = numbers.map((num, idx) => ({ idx, num }));
@@ -1031,6 +1042,13 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'set_vip_bulk' });
       return editMsg(chatId, msgId, `👑 <b>VIP Bulk Limit</b>\n\nCurrent: <code>${db.getSetting('vip_bulk') || '1000'}</code>\n\nSend max numbers per request:`, backBtn);
+
+    case 'set_api_key':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_api_key' });
+      return editMsg(chatId, msgId,
+        `🔑 <b>Set API Key</b>\n\nCurrent: <code>${db.getSetting('api_key') || 'Not set'}</code>\n\nSend a strong secret key or <code>auto</code> to generate one:`,
+        backBtn);
 
     case 'set_upi_id':
       if (!isAdmin(userId)) return;
@@ -2116,7 +2134,8 @@ async function showBotSettings(chatId, userId, msgId) {
     `\n👑 <b>VIP Daily:</b> <code>${db.getSetting('vip_limit') || 'Unlimited'}</code>\n` +
     `👑 <b>VIP Bulk:</b>  <code>${db.getSetting('vip_bulk') || '1000'}</code>\n` +
     `🖼 <b>Menu image:</b> ${menuImg ? '✅ Set' : '❌ Not set'}\n` +
-    `💳 <b>UPI ID:</b> <code>${db.getSetting('upi_id') || 'Not set'}</code>`,
+    `💳 <b>UPI ID:</b>  <code>${db.getSetting('upi_id') || 'Not set'}</code>\n` +
+    `🔑 <b>API Key:</b>  <code>${db.getSetting('api_key') ? '✅ Set' : '❌ Not set'}</code>`,
     { inline_keyboard: [
       [{ text: mode==='public'?'✅ Public':'⬜ Public', callback_data:'set_public' },
        { text: mode==='private'?'✅ Private':'⬜ Private', callback_data:'set_private' }],
@@ -2128,6 +2147,7 @@ async function showBotSettings(chatId, userId, msgId) {
        { text: '💎 Premium Limit', callback_data:'set_prem_limit' }],
       [{ text: '📁 Bulk Limit', callback_data:'set_bulk_limit' },
        { text: '🔗 Refer Bonus', callback_data:'set_refer_bonus' }],
+      [{ text: '🔑 Set API Key', callback_data: 'set_api_key' }],
       [{ text: '💳 Set UPI ID', callback_data: 'set_upi_id' }],
       [{ text: '👑 VIP Daily Limit', callback_data: 'set_vip_limit' },
        { text: '👑 VIP Bulk Limit',  callback_data: 'set_vip_bulk' }],
@@ -2679,6 +2699,24 @@ bot.on('message', async msg => {
     return bot.sendMessage(chatId, `✅ Referral bonus set to <b>${v} checks</b>`, { parse_mode: 'HTML' });
   }
 
+  if (state?.mode === 'set_api_key') {
+    userStates.delete(userId);
+    let key = text.trim();
+    if (key.toLowerCase() === 'auto') {
+      key = require('crypto').randomBytes(24).toString('hex');
+    }
+    db.setSetting('api_key', key);
+    const renderUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'your-app.onrender.com'}`;
+    return bot.sendMessage(chatId,
+      `✅ <b>API Key Set!</b>\n\n` +
+      `🔑 Key: <code>${esc(key)}</code>\n\n` +
+      `<b>API Endpoints:</b>\n` +
+      `• Single: <code>${renderUrl}/WSCK?phone=919876543210&key=${esc(key)}</code>\n` +
+      `• Bulk: POST <code>${renderUrl}/WSCK/bulk?key=${esc(key)}</code>\n\n` +
+      `<i>Keep this key secret!</i>`,
+      { parse_mode: 'HTML', disable_web_page_preview: true });
+  }
+
   if (state?.mode === 'set_vip_limit') {
     userStates.delete(userId);
     const val = text.trim().toLowerCase();
@@ -3217,6 +3255,64 @@ app.get('/health', (_, res) => {
     checkers: getConnectedCheckers().length,
     accounts: db.getAllAccounts().map(a => ({ id: a.account_id, connected: !!a.is_connected, type: a.account_type })),
   });
+});
+
+// ─── API KEY MIDDLEWARE ────────────────────────────────────────────────────
+function apiAuth(req, res, next) {
+  const apiKey = db.getSetting('api_key');
+  if (!apiKey) return res.status(403).json({ error: 'API not enabled. Set api_key in bot settings.' });
+  const provided = req.headers['x-api-key'] || req.query.key;
+  if (provided !== apiKey) return res.status(401).json({ error: 'Invalid API key.' });
+  next();
+}
+
+// ─── WSCK — Single Number Check ───────────────────────────────────────────
+// GET /WSCK?phone=919876543210&key=YOUR_API_KEY
+app.get('/WSCK', apiAuth, async (req, res) => {
+  const phone = (req.query.phone || '').replace(/[^0-9]/g, '');
+  if (!phone || phone.length < 7 || phone.length > 15) {
+    return res.status(400).json({ success: false, error: 'Invalid phone number. Send with country code e.g. 919876543210' });
+  }
+  const checkers = getConnectedCheckers();
+  if (!checkers.length) {
+    return res.status(503).json({ success: false, error: 'No WhatsApp accounts connected.' });
+  }
+  try {
+    const checker = checkers[Math.floor(Math.random() * checkers.length)];
+    const result  = await checkSingleNumber(checker.account_id, phone);
+    return res.json({
+      success:       true,
+      phone:         phone,
+      is_registered: result?.is_registered ?? null,
+      checked_at:    new Date().toISOString(),
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ─── WSCK/bulk — Bulk Check ───────────────────────────────────────────────
+// POST /WSCK/bulk?key=YOUR_API_KEY
+// Body: { "phones": ["919876543210", "14155552671"] }
+app.post('/WSCK/bulk', apiAuth, async (req, res) => {
+  const phones = (req.body?.phones || []).map(p => String(p).replace(/[^0-9]/g, '')).filter(p => p.length >= 7 && p.length <= 15);
+  if (!phones.length) return res.status(400).json({ success: false, error: 'Send { phones: [...] } in body.' });
+  const limit = parseInt(db.getSetting('api_bulk_limit') || '100');
+  if (phones.length > limit) return res.status(400).json({ success: false, error: `Max ${limit} numbers per request.` });
+  if (!getConnectedCheckers().length) return res.status(503).json({ success: false, error: 'No checkers connected.' });
+  try {
+    const results = await bulkCheck(phones);
+    return res.json({
+      success:    true,
+      total:      results.length,
+      registered: results.filter(r => r?.is_registered === true).map(r => r.phone_number),
+      not_registered: results.filter(r => r?.is_registered === false).map(r => r.phone_number),
+      unknown:    results.filter(r => r?.is_registered === null).map(r => r.phone_number),
+      checked_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
