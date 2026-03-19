@@ -889,6 +889,13 @@ bot.on('callback_query', async query => {
   await bot.answerCallbackQuery(query.id).catch(() => {});
 
   // ── Dynamic callbacks ──
+  if (data.startsWith('revoke_api_')) {
+    if (!isAdmin(userId)) return;
+    const key = data.replace('revoke_api_', '');
+    await deleteApiKey(key);
+    return showApiKeysPanel(chatId, userId, msgId);
+  }
+
   if (data.startsWith('fsub_del_')) {
     if (!isAdmin(userId)) return;
     const chId = data.replace('fsub_del_', '');
@@ -960,6 +967,7 @@ bot.on('callback_query', async query => {
     case 'op_settings':  return showBotSettings(chatId, userId, msgId);
     case 'op_stats':     return showDetailedStats(chatId, userId, msgId);
     case 'op_redeem':    return showRedeemPanel(chatId, userId, msgId);
+    case 'op_api_keys':  return showApiKeysPanel(chatId, userId, msgId);
     case 'op_create_code': return startCreateCode(chatId, userId, msgId);
     case 'op_logs':      return setupLogGroup(chatId, userId, msgId);
     case 'fsub_verify':  return handleFsubVerify(query);
@@ -1042,6 +1050,27 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'set_vip_bulk' });
       return editMsg(chatId, msgId, `👑 <b>VIP Bulk Limit</b>\n\nCurrent: <code>${db.getSetting('vip_bulk') || '1000'}</code>\n\nSend max numbers per request:`, backBtn);
+
+    case 'op_api_keys':
+      if (!isAdmin(userId)) return;
+      return showApiKeysPanel(chatId, userId, msgId);
+
+    case 'op_create_api_key':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'create_api_key' });
+      return editMsg(chatId, msgId,
+        `🔑 <b>Create API Key</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Send in this format:\n\n` +
+        `<code>LABEL PLAN DAYS</code>\n\n` +
+        `<b>Plans:</b>\n` +
+        `• <code>basic</code>    — 1,000 req/day\n` +
+        `• <code>pro</code>      — 10,000 req/day\n` +
+        `• <code>business</code> — Unlimited\n\n` +
+        `<b>Examples:</b>\n` +
+        `<code>John basic 30</code>   — Basic, 30 days\n` +
+        `<code>Agency pro 90</code>   — Pro, 90 days\n` +
+        `<code>Client business 0</code> — Business, no expiry\n`,
+        backBtn);
 
     case 'set_api_key':
       if (!isAdmin(userId)) return;
@@ -1503,6 +1532,7 @@ async function showOwnerPanel(chatId, userId, msgId) {
       [{ text: '🎟 Add Checks to User', callback_data: 'op_add_checks' }],
     [{ text: '📢 Broadcast', callback_data: 'op_broadcast' }, { text: '📋 Logs', callback_data: 'op_logs' }],
     [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🎟 Redeem Codes', callback_data: 'op_redeem' }],
+      [{ text: '🔑 API Keys', callback_data: 'op_api_keys' }],
       [{ text: '🔒 Force Sub', callback_data: 'op_fsub' }],
     [{ text: '⚙️ Settings', callback_data: 'op_settings' }],
     [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
@@ -2109,6 +2139,35 @@ async function showRedeemPanel(chatId, userId, msgId) {
   return editMsg(chatId, msgId, body, kb);
 }
 
+// ─── API KEYS PANEL ─────────────────────────────────────────────────────────
+async function showApiKeysPanel(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const keys  = [..._apiKeys.values()];
+  const today = new Date().toISOString().split('T')[0];
+  let body    = `🔑 <b>API Keys</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  if (!keys.length) {
+    body += `<i>No client API keys yet.</i>`;
+  } else {
+    for (const k of keys) {
+      const expired = k.expires_at && new Date(k.expires_at) < new Date();
+      const icon    = expired ? '🔴' : '🟢';
+      const used    = k.reset_date === today ? (k.used_today || 0) : 0;
+      const limit   = k.daily_limit >= 999999 ? '∞' : k.daily_limit;
+      const exp     = k.expires_at ? new Date(k.expires_at).toLocaleDateString() : 'Never';
+      body += `${icon} <b>${esc(k.label)}</b> [${k.plan}]\n`;
+      body += `  📊 ${used}/${limit} today | 📅 ${exp}\n`;
+      body += `  🔑 <code>${esc(k.key)}</code>\n\n`;
+    }
+  }
+  const rows = [];
+  for (const k of keys.slice(0, 8)) {
+    rows.push([{ text: `🗑 Revoke: ${k.label}`, callback_data: `revoke_api_${k.key}` }]);
+  }
+  rows.push([{ text: '➕ Create New Key', callback_data: 'op_create_api_key' }]);
+  rows.push([{ text: '‹ Back', callback_data: 'owner_panel' }]);
+  return editMsg(chatId, msgId, body, { inline_keyboard: rows });
+}
+
 // ─── BOT SETTINGS ─────────────────────────────────────────────────────────────
 async function showBotSettings(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
@@ -2699,6 +2758,48 @@ bot.on('message', async msg => {
     return bot.sendMessage(chatId, `✅ Referral bonus set to <b>${v} checks</b>`, { parse_mode: 'HTML' });
   }
 
+  if (state?.mode === 'create_api_key') {
+    userStates.delete(userId);
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 3) {
+      return bot.sendMessage(chatId, `❌ Format: <code>LABEL PLAN DAYS</code>\nExample: <code>John basic 30</code>`, { parse_mode: 'HTML' });
+    }
+    const label = parts[0];
+    const plan  = parts[1].toLowerCase();
+    const days  = parseInt(parts[2]);
+    const planLimits = { basic: 1000, pro: 10000, business: 999999 };
+    if (!planLimits[plan]) {
+      return bot.sendMessage(chatId, `❌ Invalid plan. Use: <code>basic</code>, <code>pro</code>, <code>business</code>`, { parse_mode: 'HTML' });
+    }
+    const key      = require('crypto').randomBytes(20).toString('hex');
+    const expiresAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : null;
+    const keyObj   = {
+      key, label, plan,
+      daily_limit: planLimits[plan],
+      used_today:  0,
+      reset_date:  new Date().toISOString().split('T')[0],
+      expires_at:  expiresAt,
+      owner_id:    userId,
+      created_at:  new Date().toISOString(),
+    };
+    _apiKeys.set(key, keyObj);
+    await saveApiKey(keyObj);
+    const renderUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'newwpchecker.onrender.com'}`;
+    const expTxt    = expiresAt ? new Date(expiresAt).toLocaleDateString() : 'Never';
+    const limitTxt  = planLimits[plan] >= 999999 ? 'Unlimited' : planLimits[plan].toLocaleString();
+    return bot.sendMessage(chatId,
+      `✅ <b>API Key Created!</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `👤 Label:  <b>${esc(label)}</b>\n` +
+      `📦 Plan:   <b>${plan}</b> (${limitTxt} req/day)\n` +
+      `📅 Expires: <b>${expTxt}</b>\n\n` +
+      `🔑 <b>Key:</b>\n<code>${key}</code>\n\n` +
+      `<b>Usage:</b>\n` +
+      `<code>${renderUrl}/WSCK?phone=91xxxxxxxxxx&key=${key}</code>\n\n` +
+      `<i>Share this key with your client. Keep it secret!</i>`,
+      { parse_mode: 'HTML', disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: '🔑 View All Keys', callback_data: 'op_api_keys' }]] }});
+  }
+
   if (state?.mode === 'set_api_key') {
     userStates.delete(userId);
     let key = text.trim();
@@ -3257,12 +3358,76 @@ app.get('/health', (_, res) => {
   });
 });
 
-// ─── API KEY MIDDLEWARE ────────────────────────────────────────────────────
-function apiAuth(req, res, next) {
-  const apiKey = db.getSetting('api_key');
-  if (!apiKey) return res.status(403).json({ error: 'API not enabled. Set api_key in bot settings.' });
+// ─── API KEYS IN-MEMORY STORE (loaded from Supabase) ─────────────────────
+const _apiKeys = new Map(); // key → { plan, daily_limit, used_today, reset_date, expires_at, owner_id, label }
+
+async function loadApiKeys() {
+  if (!supabase) return;
+  try {
+    const { data } = await supabase.from('api_keys').select('*');
+    (data || []).forEach(k => _apiKeys.set(k.key, k));
+  } catch (_) {}
+}
+
+async function saveApiKey(keyObj) {
+  if (!supabase) return;
+  try {
+    await supabase.from('api_keys').upsert(keyObj, { onConflict: 'key' });
+  } catch (_) {}
+}
+
+async function deleteApiKey(key) {
+  _apiKeys.delete(key);
+  if (!supabase) return;
+  try { await supabase.from('api_keys').delete().eq('key', key); } catch (_) {}
+}
+
+// ─── API KEY MIDDLEWARE ─────────────────────────────────────────────────────
+async function apiAuth(req, res, next) {
   const provided = req.headers['x-api-key'] || req.query.key;
-  if (provided !== apiKey) return res.status(401).json({ error: 'Invalid API key.' });
+  if (!provided) return res.status(401).json({ error: 'API key required. Add ?key=YOUR_KEY or X-Api-Key header.' });
+
+  // Check master key (owner)
+  const masterKey = db.getSetting('api_key');
+  if (masterKey && provided === masterKey) {
+    req.apiPlan = 'master'; req.apiLimit = 999999;
+    return next();
+  }
+
+  // Check client keys
+  const keyData = _apiKeys.get(provided);
+  if (!keyData) return res.status(401).json({ error: 'Invalid API key.' });
+
+  // Check expiry
+  if (keyData.expires_at && new Date(keyData.expires_at) < new Date()) {
+    return res.status(403).json({ error: 'API key expired.', expired_at: keyData.expires_at });
+  }
+
+  // Check daily limit
+  const today = new Date().toISOString().split('T')[0];
+  if (keyData.reset_date !== today) {
+    keyData.used_today = 0;
+    keyData.reset_date = today;
+    await saveApiKey(keyData);
+  }
+
+  if (keyData.daily_limit > 0 && keyData.used_today >= keyData.daily_limit) {
+    return res.status(429).json({
+      error: 'Daily limit reached.',
+      limit: keyData.daily_limit,
+      used:  keyData.used_today,
+      resets: 'midnight',
+    });
+  }
+
+  // Increment usage
+  keyData.used_today = (keyData.used_today || 0) + 1;
+  _apiKeys.set(provided, keyData);
+  saveApiKey(keyData).catch(() => {});
+
+  req.apiPlan  = keyData.plan;
+  req.apiLimit = keyData.daily_limit;
+  req.apiKey   = keyData;
   next();
 }
 
@@ -3323,6 +3488,7 @@ const PORT = config.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
   await db.init();
+  await loadApiKeys();
   applyEnvSettings();
   // Refresh channel names/links from Telegram on every boot
   const _allChs = fsub.getAll();
