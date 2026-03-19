@@ -1904,7 +1904,7 @@ async function handleUserRole(chatId, adminId, msgId, targetId, role) {
 async function handleClearBonus(chatId, adminId, msgId, targetId) {
   if (!isAdmin(adminId)) return;
   if (supabase) {
-    await supabase.from('users').update({ bonus_checks: 0 }).eq('telegram_id', targetId).catch(() => {});
+    try { await supabase.from('users').update({ bonus_checks: 0 }).eq('telegram_id', targetId); } catch(_) {}
     const u = db.getUser(targetId);
     if (u) u.bonus_checks = 0;
   }
@@ -1944,7 +1944,7 @@ async function handleAddBonusChecks(chatId, adminId, msgId, targetId, checks) {
 
   // Update in Supabase + local cache
   if (supabase) {
-    await supabase.from('users').update({ bonus_checks: newBonus }).eq('telegram_id', targetId);
+    try { await supabase.from('users').update({ bonus_checks: newBonus }).eq('telegram_id', targetId); } catch(_) {}
   }
   const cached = db.getUser(targetId);
   if (cached) cached.bonus_checks = newBonus;
@@ -1980,7 +1980,7 @@ async function handleAddPremium(chatId, adminId, msgId, targetId, days, plan = '
 
   // Save plan type
   if (supabase) {
-    await supabase.from('users').update({ premium_plan: plan }).eq('telegram_id', targetId).catch(() => {});
+    try { await supabase.from('users').update({ premium_plan: plan }).eq('telegram_id', targetId); } catch(_) {}
   }
   const u = db.getUser(targetId);
   if (u) u.premium_plan = plan;
@@ -2468,7 +2468,7 @@ bot.on('message', async msg => {
 
     // Update Supabase
     if (supabase) {
-      await supabase.from('users').update({ bonus_checks: newBonus }).eq('telegram_id', targetId);
+      try { await supabase.from('users').update({ bonus_checks: newBonus }).eq('telegram_id', targetId); } catch(_) {}
       const cached = db.getUser(targetId);
       if (cached) cached.bonus_checks = newBonus;
     }
