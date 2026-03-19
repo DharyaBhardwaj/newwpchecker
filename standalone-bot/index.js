@@ -59,6 +59,10 @@ _fsubSqlite.exec(`CREATE TABLE IF NOT EXISTS fsub_channels (
   title TEXT, link TEXT,
   added_at TEXT DEFAULT CURRENT_TIMESTAMP
 );`);
+
+// Redeem codes table (uses same bot.db via db module's connection)
+// We add it via the existing db require
+db.initRedeemTable();
 const fsub = {
   getAll()               { return _fsubSqlite.prepare('SELECT * FROM fsub_channels ORDER BY id ASC').all(); },
   add(id, title, link)   { return _fsubSqlite.prepare('INSERT OR REPLACE INTO fsub_channels (channel_id,title,link) VALUES (?,?,?)').run(id, title||id, link||''); },
@@ -601,6 +605,7 @@ function mainMenu(userId) {
     [{ text: '🔍 Check Number', callback_data: 'check_number' }, { text: '📋 Bulk Check', callback_data: 'bulk_check' }],
     [{ text: '🧰 Tools', callback_data: 'tools' },               { text: '👤 My Profile', callback_data: 'profile' }],
     [{ text: '💎 Premium Plans', callback_data: 'premium_info' },{ text: '🎁 Referral', callback_data: 'referral' }],
+    [{ text: '🎟 Redeem Code', callback_data: 'redeem_input' }],
     [{ text: '📡 Bot Status', callback_data: 'status' },          { text: '📖 Help', callback_data: 'help' }],
   ];
   // Show WhatsApp button to normal users only when owner has enabled it
@@ -920,6 +925,8 @@ bot.on('callback_query', async query => {
     case 'op_fsub':      return showFsubSettings(chatId, userId, msgId);
     case 'op_settings':  return showBotSettings(chatId, userId, msgId);
     case 'op_stats':     return showDetailedStats(chatId, userId, msgId);
+    case 'op_redeem':    return showRedeemPanel(chatId, userId, msgId);
+    case 'op_create_code': return startCreateCode(chatId, userId, msgId);
     case 'op_logs':      return setupLogGroup(chatId, userId, msgId);
     case 'fsub_verify':  return handleFsubVerify(query);
 
@@ -1016,6 +1023,43 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'add_premium_uid' });
       return editMsg(chatId, msgId, `💎 <b>Add Premium</b>\n\nSend the user's Telegram ID:`, backBtn);
+
+    case 'redeem_input':
+      userStates.set(userId, { mode: 'redeem_code' });
+      return editMsg(chatId, msgId,
+        `🎟 <b>Redeem Code</b>\n━━━━━━━━━━━━━━━━━━━━\n\nSend your redeem code:`,
+        backBtn);
+
+    case 'op_create_code':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'create_redeem', maxUses: 1 });
+      return editMsg(chatId, msgId,
+        `🎟 <b>Create Redeem Code</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Send checks amount or custom code:\n\n` +
+        `• Just checks: <code>50</code>\n` +
+        `• Custom code: <code>SUMMER25:50</code>\n\n` +
+        `<i>Code will work once by default.</i>`,
+        backBtn);
+
+    case 'redeem':
+      userStates.set(userId, { mode: 'redeem_code' });
+      return editMsg(chatId, msgId,
+        `🎟 <b>Redeem Code</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Enter your redeem code to get bonus checks:\n\n` +
+        `<i>Codes are case-insensitive.</i>`,
+        backBtn);
+
+    case 'op_redeem':
+      if (!isAdmin(userId)) return;
+      return showRedeemPanel(chatId, userId, msgId);
+
+    case 'op_create_code':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'create_code_checks' });
+      return editMsg(chatId, msgId,
+        `🎟 <b>Create Redeem Code</b>\n\nStep 1: How many bonus checks should this code give?\n<i>Send a number e.g. 50</i>`,
+        backBtn);
 
     case 'tools_upload':
       userStates.set(userId, { mode: 'upload' });
@@ -1312,7 +1356,8 @@ async function showOwnerPanel(chatId, userId, msgId) {
     [{ text: userWaOn ? '🟢 User WA: ON — Disable' : '🔴 User WA: OFF — Enable', callback_data: 'toggle_user_wa' }],
     [{ text: '👥 Users', callback_data: 'op_users' }, { text: '💎 Add Premium', callback_data: 'op_add_premium' }],
     [{ text: '📢 Broadcast', callback_data: 'op_broadcast' }, { text: '📋 Logs', callback_data: 'op_logs' }],
-    [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🔒 Force Sub', callback_data: 'op_fsub' }],
+    [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🎟 Redeem Codes', callback_data: 'op_redeem' }],
+      [{ text: '🔒 Force Sub', callback_data: 'op_fsub' }],
     [{ text: '⚙️ Settings', callback_data: 'op_settings' }],
     [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
   ]};
@@ -1687,10 +1732,17 @@ async function handleUserBan(chatId, adminId, msgId, targetId, ban) {
 async function handleUserRole(chatId, adminId, msgId, targetId, role) {
   if (!isOwner(adminId) && role === 'admin') return;
   db.updateRole(targetId, role);
+  const adminUser = db.getUser(adminId);
+  const adminName = adminUser?.username ? `@${adminUser.username}` : `Admin`;
   bot.sendMessage(targetId,
     role === 'admin'
-      ? `⭐ <b>You have been promoted to Admin!</b>\n\nYou now have access to the Admin Panel.`
-      : `👤 <b>Your admin role has been removed.</b>`,
+      ? `⭐ <b>You've been promoted to Admin!</b>\n\n` +
+        `By: ${esc(adminName)}\n\n` +
+        `You now have access to the <b>Admin Panel</b>.\n` +
+        `Type /start to see your new options.`
+      : `👤 <b>Your admin role has been removed.</b>\n\n` +
+        `By: ${esc(adminName)}\n\n` +
+        `You are now a regular user.`,
     { parse_mode: 'HTML' }
   ).catch(() => {});
   sendLog(`🎭 <b>User ${role === 'admin' ? 'Promoted to Admin' : 'Demoted'}</b>\n🆔 <code>${targetId}</code>\nBy: <code>${adminId}</code>`);
@@ -1700,8 +1752,13 @@ async function handleUserRole(chatId, adminId, msgId, targetId, role) {
 async function handleRemovePremium(chatId, adminId, msgId, targetId) {
   if (!isAdmin(adminId)) return;
   db.removePremium(targetId);
+  const remAdmin = db.getUser(adminId);
+  const remName  = remAdmin?.username ? `@${remAdmin.username}` : `Admin`;
   bot.sendMessage(targetId,
-    `💔 <b>Your Premium has been removed.</b>\n\nYou are now on the Free plan.`,
+    `💔 <b>Your Premium has been removed.</b>\n\n` +
+    `By: ${esc(remName)}\n\n` +
+    `You are now on the <b>Free plan</b>.\n` +
+    `Contact support to renew.`,
     { parse_mode: 'HTML' }
   ).catch(() => {});
   sendLog(`💎 <b>Premium Removed</b>\n🆔 <code>${targetId}</code>\nBy: <code>${adminId}</code>`);
@@ -1782,7 +1839,31 @@ async function showFsubSettings(chatId, userId, msgId) {
   return editMsg(chatId, msgId, body, kb);
 }
 
-// ─── BOT SETTINGS ─────────────────────────────────────────────────────────
+// ─── REDEEM PANEL ─────────────────────────────────────────────────────────────
+async function showRedeemPanel(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const codes = await db.getAllRedeemCodes();
+  let body = `🎟 <b>Redeem Codes</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  if (!codes.length) {
+    body += `<i>No codes created yet.</i>`;
+  } else {
+    for (const c of codes.slice(0, 15)) {
+      const used  = c.max_uses >= 999999 ? `${c.used_count}/∞` : `${c.used_count}/${c.max_uses}`;
+      const active = c.is_active ? '🟢' : '🔴';
+      body += `${active} <code>${esc(c.code)}</code> — <b>+${c.checks} checks</b> | Used: ${used}\n`;
+    }
+    if (codes.length > 15) body += `\n<i>...and ${codes.length - 15} more</i>`;
+  }
+
+  const kb = { inline_keyboard: [
+    [{ text: '➕ Create New Code', callback_data: 'op_create_code' }],
+    [{ text: '‹ Back', callback_data: 'owner_panel' }],
+  ]};
+  return editMsg(chatId, msgId, body, kb);
+}
+
+// ─── BOT SETTINGS ─────────────────────────────────────────────────────────────
 async function showBotSettings(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
   const mode    = db.getSetting('bot_mode')   || 'public';
@@ -1820,6 +1901,37 @@ async function showBotSettings(chatId, userId, msgId) {
        menuImg ? { text: '🗑 Remove Menu Image', callback_data: 'menu_img_remove' } : { text: '‹ Back', callback_data: 'owner_panel' }],
       menuImg ? [{ text: '‹ Back', callback_data: 'owner_panel' }] : [],
     ].filter(r => Array.isArray(r) ? r.length : true)});
+}
+
+// ─── REDEEM CODE PANEL ────────────────────────────────────────────────────────
+async function showRedeemPanel(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const codes = db.getAllRedeemCodes();
+  let body = `🎟 <b>Redeem Codes</b>\n━━━━━━━━━━━━━━━━━━━━\n\n`;
+  if (!codes.length) {
+    body += `<i>No codes created yet.</i>\n`;
+  } else {
+    for (const c of codes) {
+      const status = c.uses >= c.max_uses ? '🔴 Used' : '🟢 Active';
+      body += `${status} <code>${c.code}</code> — <b>${c.checks} checks</b> (${c.uses}/${c.max_uses} used)\n`;
+    }
+  }
+  return editMsg(chatId, msgId, body, { inline_keyboard: [
+    [{ text: '➕ Create New Code', callback_data: 'op_create_code' }],
+    [{ text: '‹ Back', callback_data: 'owner_panel' }],
+  ]});
+}
+
+async function startCreateCode(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  userStates.set(userId, { mode: 'create_redeem', maxUses: 1 });
+  return editMsg(chatId, msgId,
+    `🎟 <b>Create Redeem Code</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Send checks amount or custom code:\n\n` +
+    `• Just checks: <code>50</code>\n` +
+    `• Custom code: <code>SUMMER25:50</code>\n\n` +
+    `<i>Code will work once by default.</i>`,
+    backBtn);
 }
 
 // ─── DETAILED STATS ───────────────────────────────────────────────────────
@@ -2127,10 +2239,83 @@ bot.on('message', async msg => {
     db.setPremium(targetId, until);
     const expTxt = until ? `until ${until.toLocaleDateString()}` : 'Lifetime';
     logEvent(userId, username, 'Premium Added', `User ${targetId} — ${expTxt}`);
+    const premAdmin = db.getUser(userId);
+    const premName  = premAdmin?.username ? `@${premAdmin.username}` : `Admin`;
     bot.sendMessage(targetId,
-      `💎 <b>Premium Activated!</b>\n\n${until ? `Your premium is active until <b>${until.toLocaleDateString()}</b>.` : '✨ You have <b>Lifetime Premium</b>!'}\n\nEnjoy your benefits!`,
+      `💎 <b>Premium Activated!</b>\n\n` +
+      `By: ${esc(premName)}\n\n` +
+      `${until ? `Active until <b>${until.toLocaleDateString()}</b>` : '✨ You have <b>Lifetime Premium</b>!'}\n\n` +
+      `Enjoy your benefits! 🎉`,
       { parse_mode: 'HTML' }).catch(() => {});
     return bot.sendMessage(chatId, `✅ Premium granted to <code>${targetId}</code> — ${expTxt}`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'redeem_code') {
+    userStates.delete(userId);
+    const code = text.trim().toUpperCase();
+    try {
+      const result = await db.redeemCode(code, userId);
+      if (result.success) {
+        return bot.sendMessage(chatId,
+          `🎉 <b>Code Redeemed Successfully!</b>\n\n` +
+          `🎟 Code: <code>${esc(code)}</code>\n` +
+          `✅ You received: <b>+${result.checks} bonus checks</b>\n\n` +
+          `<i>Your balance has been updated!</i>`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '‹ Back to Menu', callback_data: 'main_menu' }]] }});
+      } else {
+        const reasons = {
+          already_redeemed: '❌ You have already redeemed this code.',
+          invalid_code:     '❌ Invalid or expired code.',
+          expired:          '❌ This code has reached its usage limit.',
+        };
+        return bot.sendMessage(chatId,
+          `🎟 <b>Redeem Failed</b>\n\n${reasons[result.reason] || '❌ Something went wrong.'}`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔄 Try Another', callback_data: 'redeem' }, { text: '‹ Back', callback_data: 'main_menu' }]] }});
+      }
+    } catch (e) {
+      return bot.sendMessage(chatId, `❌ Error: ${esc(e.message)}`, { parse_mode: 'HTML' });
+    }
+  }
+
+  if (state?.mode === 'create_code_checks') {
+    const checks = parseInt(text.trim());
+    if (isNaN(checks) || checks < 1) return bot.sendMessage(chatId, '❌ Invalid number. Send a positive number.');
+    userStates.set(userId, { mode: 'create_code_uses', checks });
+    return bot.sendMessage(chatId,
+      `🎟 Step 2: How many times can this code be used?\n<i>Send a number, or <code>0</code> for unlimited</i>`,
+      { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'create_code_uses') {
+    const { checks } = state;
+    const maxUses = parseInt(text.trim());
+    if (isNaN(maxUses) || maxUses < 0) return bot.sendMessage(chatId, '❌ Invalid. Send 0 for unlimited or a positive number.');
+    userStates.set(userId, { mode: 'create_code_name', checks, maxUses: maxUses || 999999 });
+    return bot.sendMessage(chatId,
+      `🎟 Step 3: Enter a custom code (or send <code>auto</code> to generate one):`,
+      { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'create_code_name') {
+    const { checks, maxUses } = state;
+    userStates.delete(userId);
+    let code = text.trim().toUpperCase();
+    if (code === 'AUTO') code = 'CODE' + Math.random().toString(36).slice(2,8).toUpperCase();
+    code = code.replace(/[^A-Z0-9]/g, '');
+    if (!code) return bot.sendMessage(chatId, '❌ Invalid code. Use letters and numbers only.');
+    try {
+      await db.createRedeemCode(code, checks, maxUses, userId);
+      const usageText = maxUses >= 999999 ? 'Unlimited' : maxUses;
+      return bot.sendMessage(chatId,
+        `✅ <b>Redeem Code Created!</b>\n\n` +
+        `🎟 Code: <code>${esc(code)}</code>\n` +
+        `💫 Checks: <b>${checks}</b>\n` +
+        `🔢 Max uses: <b>${usageText}</b>\n\n` +
+        `<i>Share this code with users to give them bonus checks.</i>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🎟 Manage Codes', callback_data: 'op_redeem' }]] }});
+    } catch (e) {
+      return bot.sendMessage(chatId, `❌ Error: ${esc(e.message)}\n<i>Code might already exist.</i>`, { parse_mode: 'HTML' });
+    }
   }
 
   if (state?.mode === 'set_fsub_image') {
@@ -2201,6 +2386,53 @@ bot.on('message', async msg => {
     userStates.delete(userId);
     db.setSetting('log_group_id', text.trim());
     return bot.sendMessage(chatId, `✅ Log group set to: <code>${esc(text.trim())}</code>`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'redeem_code') {
+    userStates.delete(userId);
+    const code = text.trim().toUpperCase();
+    const result = db.useRedeemCode(code, userId);
+    if (result.success) {
+      return bot.sendMessage(chatId,
+        `🎉 <b>Code Redeemed!</b>\n\n` +
+        `✅ <b>+${result.checks} checks</b> added to your account!\n` +
+        `📊 Total bonus checks: <b>${result.total_bonus}</b>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '‹ Back to Menu', callback_data: 'main_menu' }]] }});
+    } else {
+      return bot.sendMessage(chatId,
+        `❌ <b>Invalid Code</b>\n\n${esc(result.error)}`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '🔄 Try Again', callback_data: 'redeem_input' }],
+          [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+        ]}});
+    }
+  }
+
+  if (state?.mode === 'create_redeem') {
+    userStates.delete(userId);
+    if (!isAdmin(userId)) return;
+    // Format: CODE:CHECKS or just CHECKS (auto-generate code)
+    const parts = text.trim().split(':');
+    let code, checks;
+    if (parts.length === 2) {
+      code   = parts[0].trim().toUpperCase();
+      checks = parseInt(parts[1].trim());
+    } else {
+      checks = parseInt(parts[0].trim());
+      code   = null; // auto-generate
+    }
+    if (isNaN(checks) || checks < 1) {
+      return bot.sendMessage(chatId, '❌ Invalid. Send: <code>CHECKS</code> or <code>CODE:CHECKS</code>', { parse_mode: 'HTML' });
+    }
+    const maxUses = state.maxUses || 1;
+    const newCode = db.createRedeemCode(checks, maxUses, userId, code);
+    return bot.sendMessage(chatId,
+      `✅ <b>Redeem Code Created!</b>\n\n` +
+      `🎟 Code: <code>${newCode.code}</code>\n` +
+      `💰 Checks: <b>${newCode.checks}</b>\n` +
+      `👥 Max uses: <b>${newCode.max_uses}</b>\n\n` +
+      `<i>Share this code with users.</i>`,
+      { parse_mode: 'HTML' });
   }
 
   if (state?.mode === 'upload') {
@@ -2306,7 +2538,54 @@ bot.on('document', async msg => {
 
     if (!nums.length) return bot.sendMessage(chatId, '❌ No valid numbers found in file.');
 
-    if (state?.mode === 'upload') {
+    if (state?.mode === 'redeem_code') {
+    userStates.delete(userId);
+    const code = text.trim().toUpperCase();
+    const result = db.useRedeemCode(code, userId);
+    if (result.success) {
+      return bot.sendMessage(chatId,
+        `🎉 <b>Code Redeemed!</b>\n\n` +
+        `✅ <b>+${result.checks} checks</b> added to your account!\n` +
+        `📊 Total bonus checks: <b>${result.total_bonus}</b>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '‹ Back to Menu', callback_data: 'main_menu' }]] }});
+    } else {
+      return bot.sendMessage(chatId,
+        `❌ <b>Invalid Code</b>\n\n${esc(result.error)}`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '🔄 Try Again', callback_data: 'redeem_input' }],
+          [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+        ]}});
+    }
+  }
+
+  if (state?.mode === 'create_redeem') {
+    userStates.delete(userId);
+    if (!isAdmin(userId)) return;
+    // Format: CODE:CHECKS or just CHECKS (auto-generate code)
+    const parts = text.trim().split(':');
+    let code, checks;
+    if (parts.length === 2) {
+      code   = parts[0].trim().toUpperCase();
+      checks = parseInt(parts[1].trim());
+    } else {
+      checks = parseInt(parts[0].trim());
+      code   = null; // auto-generate
+    }
+    if (isNaN(checks) || checks < 1) {
+      return bot.sendMessage(chatId, '❌ Invalid. Send: <code>CHECKS</code> or <code>CODE:CHECKS</code>', { parse_mode: 'HTML' });
+    }
+    const maxUses = state.maxUses || 1;
+    const newCode = db.createRedeemCode(checks, maxUses, userId, code);
+    return bot.sendMessage(chatId,
+      `✅ <b>Redeem Code Created!</b>\n\n` +
+      `🎟 Code: <code>${newCode.code}</code>\n` +
+      `💰 Checks: <b>${newCode.checks}</b>\n` +
+      `👥 Max uses: <b>${newCode.max_uses}</b>\n\n` +
+      `<i>Share this code with users.</i>`,
+      { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'upload') {
       userStates.delete(userId);
       for (const n of nums) db.addNumber(userId, n.replace(/\D/g,''));
       return bot.sendMessage(chatId, `✅ <b>${nums.length} numbers</b> added to your pool!`, { parse_mode: 'HTML' });
@@ -2377,6 +2656,62 @@ async function processNumbers(chatId, userId, numbers, opts = {}) {
 
   db.incrementStats(reg.length, noReg.length);
   db.incrementDailyChecks(userId, numbers.length);
+
+  // ── Log to Supabase for website dashboard ──────────────────────────────
+  if (supabase) {
+    try {
+      const u = db.getUser(userId);
+      // 1. Insert job record
+      const { data: job } = await supabase.from('verification_jobs').insert({
+        telegram_user_id:      userId,
+        telegram_username:     u?.username || null,
+        total_numbers:         numbers.length,
+        registered_count:      reg.length,
+        not_registered_count:  noReg.length,
+        status:                'completed',
+        completed_at:          new Date().toISOString(),
+      }).select().single();
+
+      // 2. Insert individual results
+      if (job?.id && results.length > 0) {
+        const rows = results
+          .filter(r => r && r.phone_number)
+          .map(r => ({
+            job_id:       job.id,
+            phone_number: r.phone_number,
+            is_registered: r.is_registered ?? null,
+          }));
+        if (rows.length > 0) {
+          await supabase.from('verification_results').insert(rows);
+        }
+      }
+
+      // 3. Upsert daily stats — increment existing row
+      const today = new Date().toISOString().split('T')[0];
+      // Try increment via RPC first, fallback to upsert
+      const { data: existing } = await supabase
+        .from('daily_stats')
+        .select('*')
+        .eq('date', today)
+        .single();
+
+      if (existing) {
+        await supabase.from('daily_stats').update({
+          total_checks:         (existing.total_checks         || 0) + numbers.length,
+          registered_count:     (existing.registered_count     || 0) + reg.length,
+          not_registered_count: (existing.not_registered_count || 0) + noReg.length,
+        }).eq('date', today);
+      } else {
+        await supabase.from('daily_stats').insert({
+          date:                 today,
+          total_checks:         numbers.length,
+          registered_count:     reg.length,
+          not_registered_count: noReg.length,
+          unique_users:         1,
+        });
+      }
+    } catch (_) {}
+  }
 
   const lines = [
     `✅ <b>Results</b>`,
@@ -2506,6 +2841,7 @@ app.get('/health', (_, res) => {
 const PORT = config.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server running on port ${PORT}`);
+  await db.init();
   applyEnvSettings();
   // Refresh channel names/links from Telegram on every boot
   const _allChs = fsub.getAll();

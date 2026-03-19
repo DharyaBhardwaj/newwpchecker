@@ -1,353 +1,404 @@
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+// ════════════════════════════════════════════════════════════════════════════
+//  Database — Supabase as primary store (persists across Render redeploys)
+//  Falls back to in-memory cache for reads to keep it fast
+// ════════════════════════════════════════════════════════════════════════════
 
-const dataDir = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : (fs.existsSync('/var/data') ? '/var/data' : path.join(__dirname, 'data'));
+'use strict';
 
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+const { createClient } = require('@supabase/supabase-js');
 
-const db = new Database(path.join(dataDir, 'bot.db'));
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    telegram_id   INTEGER PRIMARY KEY,
-    username      TEXT,
-    first_name    TEXT,
-    role          TEXT    DEFAULT 'user',
-    is_blocked    INTEGER DEFAULT 0,
-    is_allowed    INTEGER DEFAULT 0,
-    is_premium    INTEGER DEFAULT 0,
-    premium_until TEXT,
-    numbers_checked INTEGER DEFAULT 0,
-    daily_checks  INTEGER DEFAULT 0,
-    daily_reset   TEXT    DEFAULT CURRENT_DATE,
-    refer_code    TEXT    UNIQUE,
-    referred_by   INTEGER,
-    refer_count   INTEGER DEFAULT 0,
-    bonus_checks  INTEGER DEFAULT 0,
-    joined_at     TEXT    DEFAULT CURRENT_TIMESTAMP,
-    last_active   TEXT    DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS stats (
-    date                 TEXT PRIMARY KEY,
-    total_checks         INTEGER DEFAULT 0,
-    registered_count     INTEGER DEFAULT 0,
-    not_registered_count INTEGER DEFAULT 0,
-    unique_users         INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS number_pool (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      INTEGER NOT NULL,
-    phone_number TEXT    NOT NULL,
-    is_used      INTEGER DEFAULT 0,
-    created_at   TEXT    DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS wa_accounts (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id   TEXT    NOT NULL UNIQUE,
-    label        TEXT,
-    phone_number TEXT,
-    account_type TEXT    DEFAULT 'checker',
-    is_enabled   INTEGER DEFAULT 1,
-    is_connected INTEGER DEFAULT 0,
-    added_at     TEXT    DEFAULT CURRENT_TIMESTAMP,
-    last_connected TEXT,
-    total_checks INTEGER DEFAULT 0,
-    ban_count    INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS fsub_channels (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id TEXT    NOT NULL UNIQUE,
-    title      TEXT,
-    link       TEXT,
-    added_at   TEXT    DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS refer_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    referrer_id INTEGER NOT NULL,
-    referred_id INTEGER NOT NULL,
-    bonus_given INTEGER DEFAULT 0,
-    created_at  TEXT    DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
-// Migrations
-const migrations = [
-  `ALTER TABLE users ADD COLUMN is_allowed INTEGER DEFAULT 0`,
-  `ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0`,
-  `ALTER TABLE users ADD COLUMN premium_until TEXT`,
-  `ALTER TABLE users ADD COLUMN daily_checks INTEGER DEFAULT 0`,
-  `ALTER TABLE users ADD COLUMN daily_reset TEXT DEFAULT CURRENT_DATE`,
-  `ALTER TABLE users ADD COLUMN refer_code TEXT`,
-  `ALTER TABLE users ADD COLUMN referred_by INTEGER`,
-  `ALTER TABLE users ADD COLUMN refer_count INTEGER DEFAULT 0`,
-  `ALTER TABLE users ADD COLUMN bonus_checks INTEGER DEFAULT 0`,
-  `ALTER TABLE users ADD COLUMN first_name TEXT`,
-  `ALTER TABLE wa_accounts ADD COLUMN account_type TEXT DEFAULT 'checker'`,
-];
-for (const sql of migrations) {
-  try { db.exec(sql); } catch (_) {}
+if (!process.env.SUPABASE_URL || !process.env.SB_SERVICE_KEY) {
+  throw new Error('SUPABASE_URL and SB_SERVICE_KEY must be set!');
 }
 
-// ─── HELPERS ────────────────────────────────────────────────────────────────
+const sb = createClient(process.env.SUPABASE_URL, process.env.SB_SERVICE_KEY);
+
+// ─── In-memory caches (populated at boot, kept in sync) ──────────────────────
+const _users    = new Map(); // telegram_id → user object
+const _settings = new Map(); // key → value
+const _accounts = new Map(); // account_id → account object
+const _stats    = new Map(); // date → stats object
+const _fsub     = [];        // array of fsub channels
+const _referLog = new Set(); // referred_id (to dedup)
+
+// ─── BOOT: load everything from Supabase ─────────────────────────────────────
+async function init() {
+  try {
+    const [users, settings, accounts, stats, fsub, referLog] = await Promise.all([
+      sb.from('users').select('*'),
+      sb.from('bot_settings').select('*'),
+      sb.from('wa_accounts').select('*').order('id'),
+      sb.from('bot_stats').select('*'),
+      sb.from('fsub_channels').select('*').order('id'),
+      sb.from('refer_log').select('referred_id'),
+    ]);
+
+    (users.data || []).forEach(u => _users.set(u.telegram_id, u));
+    (settings.data || []).forEach(s => _settings.set(s.key, s.value));
+    (accounts.data || []).forEach(a => _accounts.set(a.account_id, a));
+    (stats.data || []).forEach(s => _stats.set(s.date, s));
+    _fsub.length = 0; _fsub.push(...(fsub.data || []));
+    (referLog.data || []).forEach(r => _referLog.add(r.referred_id));
+
+    console.log(`[DB] Loaded: ${_users.size} users, ${_accounts.size} accounts, ${_settings.size} settings`);
+  } catch (e) {
+    console.error('[DB] Init error:', e.message);
+  }
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 function generateReferCode(telegramId) {
   return 'REF' + telegramId.toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 }
 
+function isPremActive(u) {
+  if (!u || !u.is_premium) return false;
+  if (!u.premium_until) return true;
+  return new Date(u.premium_until) > new Date();
+}
+
+// ─── USERS ───────────────────────────────────────────────────────────────────
 module.exports = {
 
-  // ─── USERS ────────────────────────────────────────────────────────────────
+  init,
 
   getUser(telegramId) {
-    return db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(telegramId);
+    return _users.get(telegramId) || null;
   },
 
   createUser(telegramId, username, firstName, role = 'user') {
-    const existing = db.prepare('SELECT telegram_id, refer_code FROM users WHERE telegram_id = ?').get(telegramId);
+    const existing = _users.get(telegramId);
     if (existing) {
-      db.prepare(`UPDATE users SET username=?, first_name=?, last_active=CURRENT_TIMESTAMP WHERE telegram_id=?`)
-        .run(username, firstName, telegramId);
-      return false; // not new
+      const updated = { ...existing, username, first_name: firstName, last_active: new Date().toISOString() };
+      _users.set(telegramId, updated);
+      sb.from('users').update({ username, first_name: firstName, last_active: new Date().toISOString() })
+        .eq('telegram_id', telegramId).then(() => {}).catch(() => {});
+      return false;
     }
     const referCode = generateReferCode(telegramId);
-    db.prepare(`
-      INSERT INTO users (telegram_id, username, first_name, role, refer_code)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(telegramId, username, firstName, role, referCode);
-    return true; // new user
+    const newUser = {
+      telegram_id: telegramId, username, first_name: firstName,
+      role, is_blocked: 0, is_allowed: 0, is_premium: 0,
+      premium_until: null, numbers_checked: 0,
+      daily_checks: 0, daily_reset: new Date().toISOString().split('T')[0],
+      refer_code: referCode, referred_by: null,
+      refer_count: 0, bonus_checks: 0,
+      joined_at: new Date().toISOString(), last_active: new Date().toISOString(),
+    };
+    _users.set(telegramId, newUser);
+    sb.from('users').insert(newUser).then(() => {}).catch(() => {});
+    return true;
   },
 
   getAllUsers() {
-    return db.prepare('SELECT * FROM users ORDER BY joined_at DESC').all();
+    return [..._users.values()].sort((a, b) => new Date(b.joined_at) - new Date(a.joined_at));
   },
 
   getAdmins() {
-    return db.prepare("SELECT * FROM users WHERE role IN ('admin','owner')").all();
+    return [..._users.values()].filter(u => ['admin','owner'].includes(u.role));
   },
 
   updateRole(telegramId, role) {
-    return db.prepare('UPDATE users SET role=? WHERE telegram_id=?').run(role, telegramId);
+    const u = _users.get(telegramId);
+    if (u) { u.role = role; _users.set(telegramId, u); }
+    sb.from('users').update({ role }).eq('telegram_id', telegramId).then(() => {}).catch(() => {});
   },
 
   blockUser(telegramId, blocked) {
-    return db.prepare('UPDATE users SET is_blocked=? WHERE telegram_id=?').run(blocked ? 1 : 0, telegramId);
+    const u = _users.get(telegramId);
+    if (u) { u.is_blocked = blocked ? 1 : 0; _users.set(telegramId, u); }
+    sb.from('users').update({ is_blocked: blocked ? 1 : 0 }).eq('telegram_id', telegramId).then(() => {}).catch(() => {});
   },
 
   setPremium(telegramId, until) {
-    // until = Date object or null (lifetime)
-    return db.prepare('UPDATE users SET is_premium=1, is_allowed=1, premium_until=? WHERE telegram_id=?')
-      .run(until ? until.toISOString() : null, telegramId);
+    const u = _users.get(telegramId);
+    const val = until ? until.toISOString() : null;
+    if (u) { u.is_premium = 1; u.is_allowed = 1; u.premium_until = val; _users.set(telegramId, u); }
+    sb.from('users').update({ is_premium: 1, is_allowed: 1, premium_until: val }).eq('telegram_id', telegramId).then(() => {}).catch(() => {});
   },
 
   removePremium(telegramId) {
-    return db.prepare('UPDATE users SET is_premium=0, premium_until=NULL WHERE telegram_id=?').run(telegramId);
+    const u = _users.get(telegramId);
+    if (u) { u.is_premium = 0; u.premium_until = null; _users.set(telegramId, u); }
+    sb.from('users').update({ is_premium: 0, premium_until: null }).eq('telegram_id', telegramId).then(() => {}).catch(() => {});
   },
 
   isPremiumActive(telegramId) {
-    const u = db.prepare('SELECT is_premium, premium_until FROM users WHERE telegram_id=?').get(telegramId);
-    if (!u || !u.is_premium) return false;
-    if (!u.premium_until) return true; // lifetime
-    return new Date(u.premium_until) > new Date();
+    return isPremActive(_users.get(telegramId));
   },
 
-  // Daily checks — auto reset if new day
-  getDailyChecks(telegramId) {
-    const u = db.prepare('SELECT daily_checks, daily_reset FROM users WHERE telegram_id=?').get(telegramId);
-    if (!u) return 0;
+  getRemainingChecks(telegramId, freeLimit, premiumLimit) {
+    const u = _users.get(telegramId);
+    if (!u) return { limit: freeLimit, used: 0, remaining: freeLimit, isPremium: false };
     const today = new Date().toISOString().split('T')[0];
-    if (u.daily_reset !== today) {
-      db.prepare('UPDATE users SET daily_checks=0, daily_reset=? WHERE telegram_id=?').run(today, telegramId);
-      return 0;
-    }
-    return u.daily_checks || 0;
+    const used  = u.daily_reset === today ? (u.daily_checks || 0) : 0;
+    const prem  = isPremActive(u);
+    const limit = prem ? premiumLimit : freeLimit;
+    const bonus = u.bonus_checks || 0;
+    return { limit, used, remaining: Math.max(0, limit + bonus - used), isPremium: prem };
   },
 
   incrementDailyChecks(telegramId, count) {
     const today = new Date().toISOString().split('T')[0];
-    db.prepare(`
-      UPDATE users SET
-        daily_checks = CASE WHEN daily_reset=? THEN daily_checks+? ELSE ? END,
-        daily_reset  = ?,
-        numbers_checked = numbers_checked + ?,
-        last_active = CURRENT_TIMESTAMP
-      WHERE telegram_id=?
-    `).run(today, count, count, today, count, telegramId);
+    const u = _users.get(telegramId);
+    if (!u) return;
+    const newUsed = u.daily_reset === today ? (u.daily_checks || 0) + count : count;
+    u.daily_checks    = newUsed;
+    u.daily_reset     = today;
+    u.numbers_checked = (u.numbers_checked || 0) + count;
+    u.last_active     = new Date().toISOString();
+    _users.set(telegramId, u);
+    sb.from('users').update({
+      daily_checks: newUsed, daily_reset: today,
+      numbers_checked: u.numbers_checked,
+      last_active: u.last_active,
+    }).eq('telegram_id', telegramId).then(() => {}).catch(() => {});
   },
 
-  getRemainingChecks(telegramId, freeLimit, premiumLimit) {
-    const u = db.prepare('SELECT is_premium, premium_until, daily_checks, daily_reset, bonus_checks FROM users WHERE telegram_id=?').get(telegramId);
-    if (!u) return { limit: freeLimit, used: 0, remaining: freeLimit, isPremium: false ,
-
-  // ─── FSUB CHANNELS ────────────────────────────────────────────────────────
-
-  getAllFsubChannels() {
-    return db.prepare('SELECT * FROM fsub_channels ORDER BY id ASC').all();
-  },
-
-  addFsubChannel(channelId, title, link) {
-    return db.prepare(
-      'INSERT OR REPLACE INTO fsub_channels (channel_id, title, link) VALUES (?,?,?)'
-    ).run(channelId, title || channelId, link || '');
-  },
-
-  removeFsubChannel(channelId) {
-    return db.prepare('DELETE FROM fsub_channels WHERE channel_id=?').run(channelId);
-  },
-
-  updateFsubChannel(channelId, title, link) {
-    return db.prepare(
-      'UPDATE fsub_channels SET title=?, link=? WHERE channel_id=?'
-    ).run(title, link, channelId);
-  },
-};
-    const today = new Date().toISOString().split('T')[0];
-    const used = u.daily_reset === today ? (u.daily_checks || 0) : 0;
-    const isPrem = u.is_premium && (!u.premium_until || new Date(u.premium_until) > new Date());
-    const limit = isPrem ? premiumLimit : freeLimit;
-    const bonus = u.bonus_checks || 0;
-    const remaining = Math.max(0, limit + bonus - used);
-    return { limit, used, remaining, isPremium: isPrem, bonus };
-  },
-
-  // ─── REFER ────────────────────────────────────────────────────────────────
+  // ─── REFERRALS ──────────────────────────────────────────────────────────────
 
   getUserByReferCode(code) {
-    return db.prepare('SELECT * FROM users WHERE refer_code=?').get(code);
+    return [..._users.values()].find(u => u.refer_code === code) || null;
   },
 
   applyReferral(referrerId, referredId, bonusChecks = 10) {
-    const already = db.prepare('SELECT id FROM refer_log WHERE referred_id=?').get(referredId);
-    if (already) return false;
-    db.prepare('INSERT INTO refer_log (referrer_id, referred_id, bonus_given) VALUES (?,?,?)').run(referrerId, referredId, bonusChecks);
-    db.prepare('UPDATE users SET refer_count=refer_count+1, bonus_checks=bonus_checks+? WHERE telegram_id=?').run(bonusChecks, referrerId);
-    db.prepare('UPDATE users SET referred_by=? WHERE telegram_id=?').run(referrerId, referredId);
+    if (_referLog.has(referredId)) return false;
+    _referLog.add(referredId);
+    const referrer = _users.get(referrerId);
+    if (referrer) {
+      referrer.refer_count  = (referrer.refer_count || 0) + 1;
+      referrer.bonus_checks = (referrer.bonus_checks || 0) + bonusChecks;
+      _users.set(referrerId, referrer);
+      sb.from('users').update({ refer_count: referrer.refer_count, bonus_checks: referrer.bonus_checks })
+        .eq('telegram_id', referrerId).then(() => {}).catch(() => {});
+    }
+    const referred = _users.get(referredId);
+    if (referred) {
+      referred.referred_by = referrerId;
+      _users.set(referredId, referred);
+      sb.from('users').update({ referred_by: referrerId }).eq('telegram_id', referredId).then(() => {}).catch(() => {});
+    }
+    sb.from('refer_log').insert({ referrer_id: referrerId, referred_id: referredId, bonus_given: bonusChecks }).then(() => {}).catch(() => {});
     return true;
   },
 
-  // ─── SETTINGS ─────────────────────────────────────────────────────────────
+  // ─── SETTINGS ───────────────────────────────────────────────────────────────
 
   getSetting(key) {
-    return db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value;
+    return _settings.get(key) || null;
   },
 
   setSetting(key, value) {
-    db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
+    _settings.set(key, value);
+    sb.from('bot_settings').upsert({ key, value }, { onConflict: 'key' }).then(() => {}).catch(() => {});
   },
 
-  // ─── STATS ────────────────────────────────────────────────────────────────
+  // ─── STATS ──────────────────────────────────────────────────────────────────
 
   incrementStats(registered, notRegistered) {
     const today = new Date().toISOString().split('T')[0];
-    db.prepare(`
-      INSERT INTO stats (date, total_checks, registered_count, not_registered_count, unique_users)
-      VALUES (?, ?, ?, ?, 1)
-      ON CONFLICT(date) DO UPDATE SET
-        total_checks         = total_checks + ?,
-        registered_count     = registered_count + ?,
-        not_registered_count = not_registered_count + ?
-    `).run(today, registered + notRegistered, registered, notRegistered,
-           registered + notRegistered, registered, notRegistered);
+    const total = registered + notRegistered;
+    const s = _stats.get(today) || { date: today, total_checks: 0, registered_count: 0, not_registered_count: 0, unique_users: 0 };
+    s.total_checks         += total;
+    s.registered_count     += registered;
+    s.not_registered_count += notRegistered;
+    _stats.set(today, s);
+    sb.from('bot_stats').upsert(s, { onConflict: 'date' }).then(() => {}).catch(() => {});
   },
 
   getTotalStats() {
-    return db.prepare(`
-      SELECT SUM(total_checks) as total_checks,
-             SUM(registered_count) as registered_count,
-             SUM(not_registered_count) as not_registered_count
-      FROM stats
-    `).get();
+    const all = [..._stats.values()];
+    return {
+      total_checks:         all.reduce((s, r) => s + (r.total_checks || 0), 0),
+      registered_count:     all.reduce((s, r) => s + (r.registered_count || 0), 0),
+      not_registered_count: all.reduce((s, r) => s + (r.not_registered_count || 0), 0),
+    };
   },
 
   getStatsHistory(days = 7) {
-    return db.prepare('SELECT * FROM stats ORDER BY date DESC LIMIT ?').all(days);
+    return [..._stats.values()].sort((a, b) => b.date.localeCompare(a.date)).slice(0, days);
   },
 
-  // ─── NUMBER POOL ──────────────────────────────────────────────────────────
+  // ─── NUMBER POOL ────────────────────────────────────────────────────────────
 
-  addNumber(userId, phoneNumber) {
-    return db.prepare('INSERT INTO number_pool (user_id, phone_number) VALUES (?,?)').run(userId, phoneNumber);
+  async addNumber(userId, phoneNumber) {
+    await sb.from('number_pool').insert({ user_id: userId, phone_number: phoneNumber });
   },
 
-  getNextNumber(userId) {
-    const n = db.prepare('SELECT * FROM number_pool WHERE user_id=? AND is_used=0 ORDER BY id ASC LIMIT 1').get(userId);
-    if (n) db.prepare('UPDATE number_pool SET is_used=1 WHERE id=?').run(n.id);
-    return n;
+  async getNextNumber(userId) {
+    const { data } = await sb.from('number_pool')
+      .select('*').eq('user_id', userId).eq('is_used', 0).order('id').limit(1);
+    if (!data || !data.length) return null;
+    await sb.from('number_pool').update({ is_used: 1 }).eq('id', data[0].id);
+    return data[0];
   },
 
-  getNumberCount(userId) {
-    return db.prepare('SELECT COUNT(*) as c FROM number_pool WHERE user_id=? AND is_used=0').get(userId)?.c || 0;
+  async getNumberCount(userId) {
+    const { count } = await sb.from('number_pool')
+      .select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('is_used', 0);
+    return count || 0;
   },
 
-  // ─── WA ACCOUNTS ──────────────────────────────────────────────────────────
+  // ─── WA ACCOUNTS ────────────────────────────────────────────────────────────
 
   getAllAccounts() {
-    return db.prepare('SELECT * FROM wa_accounts ORDER BY account_type ASC, id ASC').all();
+    return [..._accounts.values()].sort((a, b) => {
+      if (a.account_type !== b.account_type) return a.account_type.localeCompare(b.account_type);
+      return (a.id || 0) - (b.id || 0);
+    });
   },
 
   getAccount(accountId) {
-    return db.prepare('SELECT * FROM wa_accounts WHERE account_id=?').get(accountId);
+    return _accounts.get(accountId) || null;
   },
 
   addAccount(accountId, label, type = 'checker') {
-    return db.prepare('INSERT OR IGNORE INTO wa_accounts (account_id, label, account_type) VALUES (?,?,?)').run(accountId, label || accountId, type);
+    if (_accounts.has(accountId)) return;
+    const acct = { account_id: accountId, label: label || accountId, account_type: type, is_enabled: 1, is_connected: 0, total_checks: 0, ban_count: 0 };
+    _accounts.set(accountId, acct);
+    sb.from('wa_accounts').upsert(acct, { onConflict: 'account_id' }).then(r => {
+      if (r.data?.[0]) _accounts.set(accountId, { ...acct, ...r.data[0] });
+    }).catch(() => {});
   },
 
   removeAccount(accountId) {
-    return db.prepare('DELETE FROM wa_accounts WHERE account_id=?').run(accountId);
+    _accounts.delete(accountId);
+    sb.from('wa_accounts').delete().eq('account_id', accountId).then(() => {}).catch(() => {});
   },
 
   setAccountConnected(accountId, isConnected, phoneNumber = null) {
-    const now = new Date().toISOString();
-    return db.prepare(`
-      UPDATE wa_accounts SET
-        is_connected   = ?,
-        phone_number   = COALESCE(?, phone_number),
-        last_connected = CASE WHEN ?=1 THEN ? ELSE last_connected END
-      WHERE account_id=?
-    `).run(isConnected ? 1 : 0, phoneNumber, isConnected ? 1 : 0, now, accountId);
+    const a = _accounts.get(accountId);
+    if (a) {
+      a.is_connected = isConnected ? 1 : 0;
+      if (phoneNumber) a.phone_number = phoneNumber;
+      if (isConnected) a.last_connected = new Date().toISOString();
+      _accounts.set(accountId, a);
+    }
+    const upd = { is_connected: isConnected ? 1 : 0 };
+    if (phoneNumber) upd.phone_number = phoneNumber;
+    if (isConnected) upd.last_connected = new Date().toISOString();
+    sb.from('wa_accounts').update(upd).eq('account_id', accountId).then(() => {}).catch(() => {});
   },
 
   setAccountEnabled(accountId, enabled) {
-    return db.prepare('UPDATE wa_accounts SET is_enabled=? WHERE account_id=?').run(enabled ? 1 : 0, accountId);
+    const a = _accounts.get(accountId);
+    if (a) { a.is_enabled = enabled ? 1 : 0; _accounts.set(accountId, a); }
+    sb.from('wa_accounts').update({ is_enabled: enabled ? 1 : 0 }).eq('account_id', accountId).then(() => {}).catch(() => {});
   },
 
   setAccountType(accountId, type) {
-    return db.prepare("UPDATE wa_accounts SET account_type=? WHERE account_id=?").run(type, accountId);
+    const a = _accounts.get(accountId);
+    if (a) { a.account_type = type; _accounts.set(accountId, a); }
+    sb.from('wa_accounts').update({ account_type: type }).eq('account_id', accountId).then(() => {}).catch(() => {});
   },
 
   incrementBanCount(accountId) {
-    return db.prepare('UPDATE wa_accounts SET ban_count=ban_count+1, is_enabled=0, is_connected=0 WHERE account_id=?').run(accountId);
+    const a = _accounts.get(accountId);
+    if (a) { a.ban_count = (a.ban_count || 0) + 1; a.is_enabled = 0; a.is_connected = 0; _accounts.set(accountId, a); }
+    sb.from('wa_accounts').update({ ban_count: (a?.ban_count || 1), is_enabled: 0, is_connected: 0 })
+      .eq('account_id', accountId).then(() => {}).catch(() => {});
   },
 
   incrementAccountChecks(accountId, count = 1) {
-    return db.prepare('UPDATE wa_accounts SET total_checks=total_checks+? WHERE account_id=?').run(count, accountId);
+    const a = _accounts.get(accountId);
+    if (a) { a.total_checks = (a.total_checks || 0) + count; _accounts.set(accountId, a); }
+    sb.from('wa_accounts').update({ total_checks: (a?.total_checks || count) })
+      .eq('account_id', accountId).then(() => {}).catch(() => {});
   },
 
   getActiveCheckerAccounts() {
-    return db.prepare(`
-      SELECT * FROM wa_accounts
-      WHERE is_connected=1 AND is_enabled=1 AND account_type='checker'
-      ORDER BY total_checks ASC
-    `).all();
+    return [..._accounts.values()].filter(a => a.is_connected && a.is_enabled && a.account_type === 'checker');
   },
 
   getEnabledBackupAccounts() {
-    return db.prepare(`
-      SELECT * FROM wa_accounts
-      WHERE is_enabled=1 AND account_type='backup'
-      ORDER BY id ASC
-    `).all();
+    return [..._accounts.values()].filter(a => a.is_enabled && a.account_type === 'backup');
   },
+
+  // ─── FSUB CHANNELS ──────────────────────────────────────────────────────────
+
+  getAllFsubChannels() { return [..._fsub]; },
+
+  addFsubChannel(channelId, title, link) {
+    const existing = _fsub.findIndex(c => c.channel_id === channelId);
+    const obj = { channel_id: channelId, title: title || channelId, link: link || '' };
+    if (existing >= 0) _fsub[existing] = { ..._fsub[existing], ...obj };
+    else _fsub.push(obj);
+    sb.from('fsub_channels').upsert(obj, { onConflict: 'channel_id' }).then(() => {}).catch(() => {});
+  },
+
+  removeFsubChannel(channelId) {
+    const i = _fsub.findIndex(c => c.channel_id === channelId);
+    if (i >= 0) _fsub.splice(i, 1);
+    sb.from('fsub_channels').delete().eq('channel_id', channelId).then(() => {}).catch(() => {});
+  },
+
+  updateFsubChannel(channelId, title, link) {
+    const obj = _fsub.find(c => c.channel_id === channelId);
+    if (obj) { obj.title = title; obj.link = link; }
+    sb.from('fsub_channels').update({ title, link }).eq('channel_id', channelId).then(() => {}).catch(() => {});
+  },
+
+  // ─── REDEEM CODES ────────────────────────────────────────────────────────────
+
+  async createRedeemCode(code, checks, maxUses, createdBy) {
+    const { data, error } = await sb.from('redeem_codes').insert({
+      code: code.toUpperCase(),
+      checks,
+      max_uses:   maxUses || 1,
+      used_count: 0,
+      is_active:  true,
+      created_by: createdBy,
+    }).select().single();
+    if (error) throw new Error(error.message);
+    return data;
+  },
+
+  async getRedeemCode(code) {
+    const { data } = await sb.from('redeem_codes')
+      .select('*').eq('code', code.toUpperCase()).eq('is_active', true).single();
+    return data;
+  },
+
+  async getAllRedeemCodes() {
+    const { data } = await sb.from('redeem_codes').select('*').order('created_at', { ascending: false });
+    return data || [];
+  },
+
+  async redeemCode(code, userId) {
+    // Check if user already redeemed this code
+    const { data: already } = await sb.from('redeem_log')
+      .select('id').eq('code', code.toUpperCase()).eq('user_id', userId).single();
+    if (already) return { success: false, reason: 'already_redeemed' };
+
+    // Get code
+    const { data: codeRow } = await sb.from('redeem_codes')
+      .select('*').eq('code', code.toUpperCase()).eq('is_active', true).single();
+    if (!codeRow) return { success: false, reason: 'invalid_code' };
+    if (codeRow.used_count >= codeRow.max_uses) return { success: false, reason: 'expired' };
+
+    // Apply bonus checks
+    const u = _users.get(userId);
+    if (u) {
+      u.bonus_checks = (u.bonus_checks || 0) + codeRow.checks;
+      _users.set(userId, u);
+      await sb.from('users').update({ bonus_checks: u.bonus_checks }).eq('telegram_id', userId);
+    }
+
+    // Log redeem
+    await sb.from('redeem_log').insert({ code: code.toUpperCase(), user_id: userId, checks: codeRow.checks });
+
+    // Increment used count, deactivate if max reached
+    const newCount = codeRow.used_count + 1;
+    await sb.from('redeem_codes').update({
+      used_count: newCount,
+      is_active: newCount < codeRow.max_uses,
+    }).eq('code', code.toUpperCase());
+
+    return { success: true, checks: codeRow.checks };
+  },
+
+  async deleteRedeemCode(code) {
+    await sb.from('redeem_codes').delete().eq('code', code.toUpperCase());
+  },
+
 };
