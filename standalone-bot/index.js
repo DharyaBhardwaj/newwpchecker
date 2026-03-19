@@ -1027,17 +1027,6 @@ bot.on('callback_query', async query => {
         `🎟 <b>Redeem Code</b>\n━━━━━━━━━━━━━━━━━━━━\n\nSend your redeem code:`,
         backBtn);
 
-    case 'op_create_code':
-      if (!isAdmin(userId)) return;
-      userStates.set(userId, { mode: 'create_redeem', maxUses: 1 });
-      return editMsg(chatId, msgId,
-        `🎟 <b>Create Redeem Code</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `Send checks amount or custom code:\n\n` +
-        `• Just checks: <code>50</code>\n` +
-        `• Custom code: <code>SUMMER25:50</code>\n\n` +
-        `<i>Code will work once by default.</i>`,
-        backBtn);
-
     case 'redeem':
       userStates.set(userId, { mode: 'redeem_code' });
       return editMsg(chatId, msgId,
@@ -1053,9 +1042,16 @@ bot.on('callback_query', async query => {
 
     case 'op_create_code':
       if (!isAdmin(userId)) return;
-      userStates.set(userId, { mode: 'create_code_checks' });
+      userStates.set(userId, { mode: 'create_code' });
       return editMsg(chatId, msgId,
-        `🎟 <b>Create Redeem Code</b>\n\nStep 1: How many bonus checks should this code give?\n<i>Send a number e.g. 50</i>`,
+        `🎟 <b>Create Redeem Code</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Send in this format:\n\n` +
+        `<code>CODE CHECKS MAXUSERS</code>\n\n` +
+        `<b>Examples:</b>\n` +
+        `• <code>SUMMER25 50 10</code> — code SUMMER25, 50 checks, 10 users\n` +
+        `• <code>VIP100 100 1</code>  — code VIP100, 100 checks, 1 user\n` +
+        `• <code>FREE50 50 0</code>   — code FREE50, 50 checks, unlimited\n\n` +
+        `<i>Send <code>auto</code> as code name to generate randomly.</i>`,
         backBtn);
 
     case 'tools_upload':
@@ -2247,6 +2243,14 @@ bot.on('message', async msg => {
     return bot.sendMessage(chatId, `✅ Premium granted to <code>${targetId}</code> — ${expTxt}`, { parse_mode: 'HTML' });
   }
 
+  if (state?.mode === 'create_redeem') {
+    // Old flow fallback — redirect to new
+    userStates.set(userId, { mode: 'create_code' });
+    return bot.sendMessage(chatId,
+      `🎟 Send: <code>CODE CHECKS MAXUSERS</code>\nExample: <code>SUMMER25 50 10</code>`,
+      { parse_mode: 'HTML' });
+  }
+
   if (state?.mode === 'redeem_code') {
     userStates.delete(userId);
     const code = text.trim().toUpperCase();
@@ -2274,44 +2278,41 @@ bot.on('message', async msg => {
     }
   }
 
-  if (state?.mode === 'create_code_checks') {
-    const checks = parseInt(text.trim());
-    if (isNaN(checks) || checks < 1) return bot.sendMessage(chatId, '❌ Invalid number. Send a positive number.');
-    userStates.set(userId, { mode: 'create_code_uses', checks });
-    return bot.sendMessage(chatId,
-      `🎟 Step 2: How many times can this code be used?\n<i>Send a number, or <code>0</code> for unlimited</i>`,
-      { parse_mode: 'HTML' });
-  }
-
-  if (state?.mode === 'create_code_uses') {
-    const { checks } = state;
-    const maxUses = parseInt(text.trim());
-    if (isNaN(maxUses) || maxUses < 0) return bot.sendMessage(chatId, '❌ Invalid. Send 0 for unlimited or a positive number.');
-    userStates.set(userId, { mode: 'create_code_name', checks, maxUses: maxUses || 999999 });
-    return bot.sendMessage(chatId,
-      `🎟 Step 3: Enter a custom code (or send <code>auto</code> to generate one):`,
-      { parse_mode: 'HTML' });
-  }
-
-  if (state?.mode === 'create_code_name') {
-    const { checks, maxUses } = state;
+  if (state?.mode === 'create_code') {
     userStates.delete(userId);
-    let code = text.trim().toUpperCase();
-    if (code === 'AUTO') code = 'CODE' + Math.random().toString(36).slice(2,8).toUpperCase();
-    code = code.replace(/[^A-Z0-9]/g, '');
-    if (!code) return bot.sendMessage(chatId, '❌ Invalid code. Use letters and numbers only.');
-    try {
-      await db.createRedeemCode(code, checks, maxUses, userId);
-      const usageText = maxUses >= 999999 ? 'Unlimited' : maxUses;
+    // Format: CODE CHECKS MAXUSERS   e.g. SUMMER25 50 10
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 2) {
       return bot.sendMessage(chatId,
-        `✅ <b>Redeem Code Created!</b>\n\n` +
-        `🎟 Code: <code>${esc(code)}</code>\n` +
-        `💫 Checks: <b>${checks}</b>\n` +
-        `🔢 Max uses: <b>${usageText}</b>\n\n` +
-        `<i>Share this code with users to give them bonus checks.</i>`,
-        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🎟 Manage Codes', callback_data: 'op_redeem' }]] }});
+        `❌ Wrong format. Send: <code>CODE CHECKS MAXUSERS</code>\nExample: <code>SUMMER25 50 10</code>`,
+        { parse_mode: 'HTML' });
+    }
+    let codeName = parts[0].toUpperCase();
+    if (codeName === 'AUTO') codeName = 'CODE' + Math.random().toString(36).slice(2,8).toUpperCase();
+    codeName = codeName.replace(/[^A-Z0-9]/g, '');
+    const checks  = parseInt(parts[1]);
+    const maxUses = parts[2] ? parseInt(parts[2]) : 1;
+    if (!codeName || isNaN(checks) || checks < 1) {
+      return bot.sendMessage(chatId, `❌ Invalid format. Example: <code>VIP100 100 5</code>`, { parse_mode: 'HTML' });
+    }
+    const actualMax = maxUses === 0 ? 999999 : maxUses;
+    try {
+      await db.createRedeemCode(codeName, checks, actualMax, userId);
+      const usageTxt = actualMax >= 999999 ? 'Unlimited' : actualMax;
+      return bot.sendMessage(chatId,
+        `✅ <b>Redeem Code Created!</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🎟 Code:      <code>${esc(codeName)}</code>\n` +
+        `💫 Checks:   <b>${checks}</b> per user\n` +
+        `👥 Max uses: <b>${usageTxt}</b>\n\n` +
+        `<i>Share this code with your users!</i>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '➕ Create Another', callback_data: 'op_create_code' }],
+          [{ text: '🎟 View All Codes', callback_data: 'op_redeem' }],
+        ]}});
     } catch (e) {
-      return bot.sendMessage(chatId, `❌ Error: ${esc(e.message)}\n<i>Code might already exist.</i>`, { parse_mode: 'HTML' });
+      return bot.sendMessage(chatId,
+        `❌ <b>Error:</b> ${esc(e.message)}\n<i>Code name might already exist.</i>`,
+        { parse_mode: 'HTML' });
     }
   }
 
@@ -2383,6 +2384,14 @@ bot.on('message', async msg => {
     userStates.delete(userId);
     db.setSetting('log_group_id', text.trim());
     return bot.sendMessage(chatId, `✅ Log group set to: <code>${esc(text.trim())}</code>`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'create_redeem') {
+    // Old flow fallback — redirect to new
+    userStates.set(userId, { mode: 'create_code' });
+    return bot.sendMessage(chatId,
+      `🎟 Send: <code>CODE CHECKS MAXUSERS</code>\nExample: <code>SUMMER25 50 10</code>`,
+      { parse_mode: 'HTML' });
   }
 
   if (state?.mode === 'redeem_code') {
@@ -2535,7 +2544,15 @@ bot.on('document', async msg => {
 
     if (!nums.length) return bot.sendMessage(chatId, '❌ No valid numbers found in file.');
 
-    if (state?.mode === 'redeem_code') {
+    if (state?.mode === 'create_redeem') {
+    // Old flow fallback — redirect to new
+    userStates.set(userId, { mode: 'create_code' });
+    return bot.sendMessage(chatId,
+      `🎟 Send: <code>CODE CHECKS MAXUSERS</code>\nExample: <code>SUMMER25 50 10</code>`,
+      { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'redeem_code') {
     userStates.delete(userId);
     const code = text.trim().toUpperCase();
     const result = db.useRedeemCode(code, userId);
