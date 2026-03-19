@@ -900,7 +900,12 @@ bot.on('callback_query', async query => {
     case 'bulk_check':   return showBulkCheck(chatId, userId, msgId);
     case 'tools':        return showTools(chatId, userId, msgId);
     case 'profile':      return showProfile(chatId, userId, msgId);
-    case 'premium_info': return showPremiumInfo(chatId, userId, msgId);
+    case 'premium_info':  return showPremiumInfo(chatId, userId, msgId);
+    case 'premium_plans': return showPremiumInfo(chatId, userId, msgId);
+    case 'buy_basic':     return showPlanDetail(chatId, userId, msgId, 'basic');
+    case 'buy_pro':       return showPlanDetail(chatId, userId, msgId, 'pro');
+    case 'buy_business':  return showPlanDetail(chatId, userId, msgId, 'business');
+    case 'buy_bundles':   return showBundleDetail(chatId, userId, msgId);
     case 'referral':     return showReferral(chatId, userId, msgId);
     case 'status':       return showStatus(chatId, userId, msgId);
     case 'help':         return showHelp(chatId, userId, msgId);
@@ -1000,6 +1005,13 @@ bot.on('callback_query', async query => {
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'set_refer_bonus' });
       return editMsg(chatId, msgId, `⚙️ <b>Set Referral Bonus Checks</b>\n\nCurrent: <code>${db.getSetting('refer_bonus') || 10}</code>\n\nSend new value:`, backBtn);
+
+    case 'set_upi_id':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_upi_id' });
+      return editMsg(chatId, msgId,
+        `💳 <b>Set UPI ID</b>\n\nCurrent: <code>${db.getSetting('upi_id') || 'Not set'}</code>\n\nSend your UPI ID:\n<i>e.g. yourname@upi</i>`,
+        backBtn);
 
     case 'set_menu_image':
       if (!isAdmin(userId)) return;
@@ -1222,47 +1234,123 @@ async function showProfile(chatId, userId, msgId) {
 async function showPremiumInfo(chatId, userId, msgId) {
   const isPrem = isPremium(userId);
   const u      = db.getUser(userId);
-  const freeLimit = db.getSetting('free_limit')  || '20';
-  const premLimit = db.getSetting('prem_limit')  || '500';
-  const bulkLimit = db.getSetting('bulk_limit')  || '100';
 
+  // ── Active premium user ───────────────────────────────────────────────────
   if (isPrem && u) {
     let expText = '';
-    if (!u.premium_until) expText = '✨ <b>Lifetime Premium</b>';
+    if (!u.premium_until) expText = '✨ <b>Lifetime Plan</b>';
     else {
       const d    = new Date(u.premium_until);
       const diff = Math.ceil((d - new Date()) / 86400000);
-      expText = `⏳ <b>${diff} day(s) remaining</b>\n📅 Expires: ${d.toLocaleDateString()}`;
+      expText = `⏳ <b>${diff} day(s) remaining</b>\n📅 Renews: ${d.toLocaleDateString('en-IN')}`;
     }
+    const plan = u.premium_plan || 'Premium';
     return editMsg(chatId, msgId,
-      `💎 <b>Premium Status</b>\n` +
+      `💎 <b>Your Plan: ${esc(plan)}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n\n` +
       `${expText}\n\n` +
-      `<b>✨ Your Benefits:</b>\n` +
-      `  ✅ <b>${premLimit}</b> checks per day\n` +
-      `  ✅ Bulk up to <b>${bulkLimit}</b> numbers\n` +
+      `<b>✨ Active Benefits:</b>\n` +
+      `  ✅ ${db.getSetting('prem_limit') || '500'} checks / day\n` +
+      `  ✅ Bulk up to ${db.getSetting('bulk_limit') || '100'} numbers\n` +
       `  ✅ Priority processing\n` +
       `  ✅ Premium support\n\n` +
-      `<i>Thank you for being a Premium member! 🙏</i>`,
-      backBtn);
+      `<i>Thank you for supporting us! 🙏</i>`,
+      { inline_keyboard: [
+        [{ text: '🔄 Upgrade / Renew', callback_data: 'premium_plans' }],
+        [{ text: '‹ Back to Menu',     callback_data: 'main_menu' }],
+      ]});
   }
 
+  // ── Free user — show plans ────────────────────────────────────────────────
   return editMsg(chatId, msgId,
-    `💎 <b>Upgrade to Premium</b>\n` +
+    `💎 <b>Premium Plans</b>\n` +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
-    `<b>Compare Plans:</b>\n\n` +
-    `<b>👤 Free</b>\n` +
-    `  • ${freeLimit} checks / day\n` +
-    `  • Basic features only\n\n` +
-    `<b>💎 Premium</b>\n` +
-    `  ✅ <b>${premLimit}</b> checks per day\n` +
-    `  ✅ Bulk up to <b>${bulkLimit}</b> numbers\n` +
-    `  ✅ Priority processing\n` +
-    `  ✅ Dedicated support\n\n` +
-    `<i>To purchase, contact the owner below:</i>`,
+    `<b>📅 Monthly Subscriptions</b>\n\n` +
+    `🆓 <b>Free</b>  — ₹0/month\n` +
+    `  └ 20 checks/day\n\n` +
+    `💎 <b>Basic</b>  — ₹99/month\n` +
+    `  └ 300 checks/day\n\n` +
+    `👑 <b>Pro</b>  — ₹249/month\n` +
+    `  └ 1,000 checks/day\n\n` +
+    `🏢 <b>Business</b>  — ₹599/month\n` +
+    `  └ Unlimited checks/day\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `<b>🎟 One-Time Check Bundles</b>\n` +
+    `<i>(₹10 = 100 checks)</i>\n\n` +
+    `  • 100 checks   — <b>₹10</b>\n` +
+    `  • 500 checks   — <b>₹50</b>\n` +
+    `  • 1,000 checks — <b>₹100</b>\n` +
+    `  • 5,000 checks — <b>₹500</b>\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `<b>💳 How to Buy:</b>\n` +
+    `Pay via <b>UPI</b> → Send screenshot to owner\n` +
+    `Owner will activate your plan instantly.\n\n` +
+    `<i>Tap below to contact owner:</i>`,
     { inline_keyboard: [
-      [{ text: '👤 ⏤͟͞Dhairya Bhardwaj', url: 'https://t.me/bhardwa_j' }],
-      [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
+      [{ text: '💎 Basic — ₹99/mo',     callback_data: 'buy_basic' },
+       { text: '👑 Pro — ₹249/mo',      callback_data: 'buy_pro' }],
+      [{ text: '🏢 Business — ₹599/mo', callback_data: 'buy_business' }],
+      [{ text: '🎟 Check Bundles',       callback_data: 'buy_bundles' }],
+      [{ text: '💬 Contact Owner',       url: 'https://t.me/bhardwa_j' }],
+      [{ text: '‹ Back to Menu',         callback_data: 'main_menu' }],
+    ]});
+}
+
+// ─── PLAN DETAIL SCREENS ──────────────────────────────────────────────────────
+async function showPlanDetail(chatId, userId, msgId, plan) {
+  const plans = {
+    basic:    { name: 'Basic',    price: '₹99/month',  daily: '300',    upi: 'Send ₹99 to UPI' },
+    pro:      { name: 'Pro',      price: '₹249/month', daily: '1,000',  upi: 'Send ₹249 to UPI' },
+    business: { name: 'Business', price: '₹599/month', daily: 'Unlimited', upi: 'Send ₹599 to UPI' },
+  };
+  const p = plans[plan];
+  if (!p) return;
+
+  // Get UPI ID from settings
+  const upiId = db.getSetting('upi_id') || 'Set UPI in Admin → Settings';
+
+  return editMsg(chatId, msgId,
+    `${plan === 'basic' ? '💎' : plan === 'pro' ? '👑' : '🏢'} <b>${p.name} Plan — ${p.price}</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `<b>✨ Benefits:</b>\n` +
+    `  ✅ <b>${p.daily}</b> checks per day\n` +
+    `  ✅ Bulk number checking\n` +
+    `  ✅ Priority processing\n` +
+    `  ✅ Premium support\n\n` +
+    `<b>💳 How to Pay:</b>\n` +
+    `1. Send <b>${p.price.split('/')[0]}</b> to UPI:\n` +
+    `   <code>${esc(upiId)}</code>\n` +
+    `2. Take a screenshot\n` +
+    `3. Send screenshot to owner\n` +
+    `4. Plan activated within minutes!\n\n` +
+    `<i>Tap below to open owner chat:</i>`,
+    { inline_keyboard: [
+      [{ text: '💬 Send Screenshot to Owner', url: 'https://t.me/bhardwa_j' }],
+      [{ text: '‹ Back to Plans', callback_data: 'premium_info' }],
+    ]});
+}
+
+async function showBundleDetail(chatId, userId, msgId) {
+  const upiId = db.getSetting('upi_id') || 'Set UPI in Admin → Settings';
+  return editMsg(chatId, msgId,
+    `🎟 <b>Check Bundles</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `<i>Rate: ₹10 = 100 checks</i>\n\n` +
+    `  📦 <b>100 checks</b>   — <b>₹10</b>\n` +
+    `  📦 <b>500 checks</b>   — <b>₹50</b>\n` +
+    `  📦 <b>1,000 checks</b> — <b>₹100</b>\n` +
+    `  📦 <b>5,000 checks</b> — <b>₹500</b>\n\n` +
+    `✅ Checks are added as <b>bonus checks</b>\n` +
+    `✅ Never expire — use anytime\n\n` +
+    `<b>💳 How to Pay:</b>\n` +
+    `1. Choose bundle & send amount to UPI:\n` +
+    `   <code>${esc(upiId)}</code>\n` +
+    `2. Screenshot owner ko bhejo\n` +
+    `3. Checks turant add kar diye jaayenge\n\n` +
+    `<i>Message mein mention karo: kitne checks chahiye</i>`,
+    { inline_keyboard: [
+      [{ text: '💬 Contact Owner', url: 'https://t.me/bhardwa_j' }],
+      [{ text: '‹ Back to Plans', callback_data: 'premium_info' }],
     ]});
 }
 
@@ -1883,7 +1971,8 @@ async function showBotSettings(chatId, userId, msgId) {
     `💎 <b>Premium limit:</b> <code>${premL}/day</code>\n` +
     `📁 <b>Bulk limit:</b> <code>${bulkL}</code>\n` +
     `🔗 <b>Refer bonus:</b> <code>${refB} checks</code>\n` +
-    `🖼 <b>Menu image:</b> ${menuImg ? '✅ Set' : '❌ Not set'}`,
+    `🖼 <b>Menu image:</b> ${menuImg ? '✅ Set' : '❌ Not set'}\n` +
+    `💳 <b>UPI ID:</b> <code>${db.getSetting('upi_id') || 'Not set'}</code>`,
     { inline_keyboard: [
       [{ text: mode==='public'?'✅ Public':'⬜ Public', callback_data:'set_public' },
        { text: mode==='private'?'✅ Private':'⬜ Private', callback_data:'set_private' }],
@@ -1895,6 +1984,7 @@ async function showBotSettings(chatId, userId, msgId) {
        { text: '💎 Premium Limit', callback_data:'set_prem_limit' }],
       [{ text: '📁 Bulk Limit', callback_data:'set_bulk_limit' },
        { text: '🔗 Refer Bonus', callback_data:'set_refer_bonus' }],
+      [{ text: '💳 Set UPI ID', callback_data: 'set_upi_id' }],
       [{ text: menuImg ? '🖼 Change Menu Image' : '🖼 Set Menu Image', callback_data: 'set_menu_image' },
        menuImg ? { text: '🗑 Remove Menu Image', callback_data: 'menu_img_remove' } : { text: '‹ Back', callback_data: 'owner_panel' }],
       menuImg ? [{ text: '‹ Back', callback_data: 'owner_panel' }] : [],
@@ -2394,6 +2484,12 @@ bot.on('message', async msg => {
     if (isNaN(v) || v < 0) return bot.sendMessage(chatId, '❌ Invalid number.');
     db.setSetting('refer_bonus', String(v));
     return bot.sendMessage(chatId, `✅ Referral bonus set to <b>${v} checks</b>`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'set_upi_id') {
+    userStates.delete(userId);
+    db.setSetting('upi_id', text.trim());
+    return bot.sendMessage(chatId, `✅ UPI ID set to: <code>${esc(text.trim())}</code>`, { parse_mode: 'HTML' });
   }
 
   if (state?.mode === 'set_log_group') {
