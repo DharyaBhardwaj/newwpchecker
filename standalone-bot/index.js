@@ -891,6 +891,13 @@ bot.on('callback_query', async query => {
   if (data.startsWith('user_demote_'))   return handleUserRole(chatId, userId, msgId, parseInt(data.replace('user_demote_','')), 'user');
   if (data.startsWith('user_remprem_'))  return handleRemovePremium(chatId, userId, msgId, parseInt(data.replace('user_remprem_','')));
   if (data.startsWith('user_prem30_'))   return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_prem30_','')), 30);
+  if (data.startsWith('user_bonus_')) {
+    if (!isAdmin(userId)) return;
+    const parts    = data.replace('user_bonus_', '').split('_');
+    const checks   = parseInt(parts[0]);
+    const targetId = parseInt(parts[1]);
+    return handleAddBonusChecks(chatId, userId, msgId, targetId, checks);
+  }
   if (data.startsWith('user_premlife_')) return handleAddPremium(chatId, userId, msgId, parseInt(data.replace('user_premlife_','')), 'lifetime');
 
   switch (data) {
@@ -1768,14 +1775,26 @@ async function handleUserInfo(chatId, adminId, msgId, targetId) {
         { text: '♾ Lifetime',    callback_data: `user_premlife_${targetId}` },
       ];
 
-  // Row 3: Role
+  // Row 3: Bonus checks
+  const bonusRow = [
+    { text: '🎟 +100 checks',  callback_data: `user_bonus_100_${targetId}` },
+    { text: '🎟 +500 checks',  callback_data: `user_bonus_500_${targetId}` },
+  ];
+  const bonusRow2 = [
+    { text: '🎟 +1000 checks', callback_data: `user_bonus_1000_${targetId}` },
+    { text: '🎟 +5000 checks', callback_data: `user_bonus_5000_${targetId}` },
+  ];
+
+  // Row 4: Role
   const roleRow = u.role === 'admin'
-    ? [{ text: '⬇️ Demote to User',     callback_data: `user_demote_${targetId}` }]
-    : [{ text: '⬆️ Promote to Admin',   callback_data: `user_promote_${targetId}` }];
+    ? [{ text: '⬇️ Demote to User',   callback_data: `user_demote_${targetId}` }]
+    : [{ text: '⬆️ Promote to Admin', callback_data: `user_promote_${targetId}` }];
 
   const kb = { inline_keyboard: [
     banRow,
     premRow,
+    bonusRow,
+    bonusRow2,
     roleRow,
     [{ text: '‹ Back to Users', callback_data: 'op_users' }],
   ]};
@@ -1848,6 +1867,38 @@ async function handleRemovePremium(chatId, adminId, msgId, targetId) {
     { parse_mode: 'HTML' }
   ).catch(() => {});
   sendLog(`💎 <b>Premium Removed</b>\n🆔 <code>${targetId}</code>\nBy: <code>${adminId}</code>`);
+  return handleUserInfo(chatId, adminId, msgId, targetId);
+}
+
+async function handleAddBonusChecks(chatId, adminId, msgId, targetId, checks) {
+  if (!isAdmin(adminId)) return;
+  const u = db.getUser(targetId);
+  if (!u) return;
+
+  // Add bonus checks directly
+  const newBonus = (u.bonus_checks || 0) + checks;
+  u.bonus_checks = newBonus;
+
+  // Update in DB
+  if (supabase) {
+    await supabase.from('users').update({ bonus_checks: newBonus }).eq('telegram_id', targetId);
+    // Update local cache in db module
+    const cached = db.getUser(targetId);
+    if (cached) cached.bonus_checks = newBonus;
+  }
+
+  // Notify user
+  bot.sendMessage(targetId,
+    `🎟 <b>Bonus Checks Added!</b>\n\n` +
+    `✅ <b>+${checks} checks</b> added to your account!\n` +
+    `📦 Total bonus: <b>${newBonus}</b>\n\n` +
+    `<i>Use them anytime — they never expire!</i>`,
+    { parse_mode: 'HTML' }).catch(() => {});
+
+  // Log
+  const logMsg = `🎟 <b>Bonus Checks Added</b>\n🆔 <code>${targetId}</code>\n💫 +${checks} checks\nBy: <code>${adminId}</code>`;
+  sendLog(logMsg);
+
   return handleUserInfo(chatId, adminId, msgId, targetId);
 }
 
