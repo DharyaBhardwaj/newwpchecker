@@ -1912,7 +1912,9 @@ async function handleClearBonus(chatId, adminId, msgId, targetId) {
   bot.sendMessage(targetId,
     `ℹ️ Your bonus checks balance has been reset to 0.`,
     { parse_mode: 'HTML' }).catch(() => {});
-  return handleUserInfo(chatId, adminId, msgId, targetId);
+  await bot.sendMessage(chatId,
+    `✅ Bonus checks cleared for <code>${targetId}</code>`,
+    { parse_mode: 'HTML' }).catch(() => {});
 }
 
 async function handleRemovePremium(chatId, adminId, msgId, targetId) {
@@ -1955,11 +1957,15 @@ async function handleAddBonusChecks(chatId, adminId, msgId, targetId, checks) {
     `<i>Use them anytime — they never expire!</i>`,
     { parse_mode: 'HTML' }).catch(() => {});
 
+  // Confirm to admin
+  await bot.sendMessage(chatId,
+    `✅ <b>Done!</b> +${checks} checks added to <code>${targetId}</code>\nNew bonus total: <b>${newBonus}</b>`,
+    { parse_mode: 'HTML' }).catch(() => {});
+
   // Log
   const logMsg = `🎟 <b>Bonus Checks Added</b>\n🆔 <code>${targetId}</code>\n💫 +${checks} checks\nBy: <code>${adminId}</code>`;
   sendLog(logMsg);
-
-  return handleUserInfo(chatId, adminId, msgId, targetId);
+  broadcastOwner(logMsg);
 }
 
 async function handleAddPremium(chatId, adminId, msgId, targetId, days, plan = 'premium') {
@@ -1997,8 +2003,14 @@ async function handleAddPremium(chatId, adminId, msgId, targetId, days, plan = '
     `\n\nEnjoy your benefits! 🎉`,
     { parse_mode: 'HTML' }).catch(() => {});
 
-  sendLog(`${isVipPlan ? '👑' : '💎'} <b>${planLabel} Added</b>\n🆔 <code>${targetId}</code>\n⏳ ${expTxt}\nBy: <code>${adminId}</code>`);
-  return handleUserInfo(chatId, adminId, msgId, targetId);
+  const logMsg2 = `${isVipPlan ? '👑' : '💎'} <b>${planLabel} Added</b>\n🆔 <code>${targetId}</code>\n⏳ ${expTxt}\nBy: <code>${adminId}</code>`;
+  sendLog(logMsg2);
+  broadcastOwner(logMsg2);
+
+  // Confirm to admin
+  await bot.sendMessage(chatId,
+    `✅ <b>${planLabel} activated!</b>\n🆔 <code>${targetId}</code>\n⏳ ${expTxt}`,
+    { parse_mode: 'HTML' }).catch(() => {});
 }
 
 // ─── BROADCAST ────────────────────────────────────────────────────────────
