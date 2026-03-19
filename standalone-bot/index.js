@@ -1045,6 +1045,19 @@ bot.on('callback_query', async query => {
       userStates.set(userId, { mode: 'add_premium_uid' });
       return editMsg(chatId, msgId, `💎 <b>Add Premium</b>\n\nSend the user's Telegram ID:`, backBtn);
 
+    case 'op_add_checks':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'add_checks_uid' });
+      return editMsg(chatId, msgId,
+        `🎟 <b>Add Bonus Checks</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `Send in this format:\n\n` +
+        `<code>USER_ID CHECKS</code>\n\n` +
+        `<b>Examples:</b>\n` +
+        `• <code>123456789 100</code>  — add 100 checks\n` +
+        `• <code>123456789 500</code>  — add 500 checks\n\n` +
+        `<i>User will be notified automatically.</i>`,
+        backBtn);
+
     case 'redeem_input':
       userStates.set(userId, { mode: 'redeem_code' });
       return editMsg(chatId, msgId,
@@ -1448,6 +1461,7 @@ async function showOwnerPanel(chatId, userId, msgId) {
     [{ text: '📱 WA Accounts', callback_data: 'op_accounts' }, { text: '➕ Add Account', callback_data: 'op_add_acct' }],
     [{ text: userWaOn ? '🟢 User WA: ON — Disable' : '🔴 User WA: OFF — Enable', callback_data: 'toggle_user_wa' }],
     [{ text: '👥 Users', callback_data: 'op_users' }, { text: '💎 Add Premium', callback_data: 'op_add_premium' }],
+      [{ text: '🎟 Add Checks to User', callback_data: 'op_add_checks' }],
     [{ text: '📢 Broadcast', callback_data: 'op_broadcast' }, { text: '📋 Logs', callback_data: 'op_logs' }],
     [{ text: '📊 Stats', callback_data: 'op_stats' }, { text: '🎟 Redeem Codes', callback_data: 'op_redeem' }],
       [{ text: '🔒 Force Sub', callback_data: 'op_fsub' }],
@@ -1879,13 +1893,12 @@ async function handleAddBonusChecks(chatId, adminId, msgId, targetId, checks) {
   const newBonus = (u.bonus_checks || 0) + checks;
   u.bonus_checks = newBonus;
 
-  // Update in DB
+  // Update in Supabase + local cache
   if (supabase) {
     await supabase.from('users').update({ bonus_checks: newBonus }).eq('telegram_id', targetId);
-    // Update local cache in db module
-    const cached = db.getUser(targetId);
-    if (cached) cached.bonus_checks = newBonus;
   }
+  const cached = db.getUser(targetId);
+  if (cached) cached.bonus_checks = newBonus;
 
   // Notify user
   bot.sendMessage(targetId,
@@ -2350,6 +2363,53 @@ bot.on('message', async msg => {
     } catch (err) {
       return bot.editMessageText(`❌ <b>Pairing Failed</b>\n\n${esc(err.message)}`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML', reply_markup: backBtn });
     }
+  }
+
+  if (state?.mode === 'add_checks_uid') {
+    userStates.delete(userId);
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 2) {
+      return bot.sendMessage(chatId,
+        `❌ Wrong format.\nSend: <code>USER_ID CHECKS</code>\nExample: <code>123456789 500</code>`,
+        { parse_mode: 'HTML' });
+    }
+    const targetId = parseInt(parts[0]);
+    const checks   = parseInt(parts[1]);
+    if (isNaN(targetId) || isNaN(checks) || checks < 1) {
+      return bot.sendMessage(chatId, `❌ Invalid. Send: <code>USER_ID CHECKS</code>`, { parse_mode: 'HTML' });
+    }
+
+    // Create user if not exists
+    db.createUser(targetId, '', '', 'user');
+    const u = db.getUser(targetId);
+    const newBonus = (u?.bonus_checks || 0) + checks;
+
+    // Update Supabase
+    if (supabase) {
+      await supabase.from('users').update({ bonus_checks: newBonus }).eq('telegram_id', targetId);
+      const cached = db.getUser(targetId);
+      if (cached) cached.bonus_checks = newBonus;
+    }
+
+    // Notify user
+    bot.sendMessage(targetId,
+      `🎟 <b>Bonus Checks Added!</b>\n\n` +
+      `✅ <b>+${checks} checks</b> added to your account!\n` +
+      `📦 Total bonus balance: <b>${newBonus} checks</b>\n\n` +
+      `<i>Use them anytime — they never expire!</i>`,
+      { parse_mode: 'HTML' }).catch(() => {});
+
+    // Log
+    const logMsg = `🎟 <b>Checks Added</b>\n🆔 <code>${targetId}</code>\n💫 +${checks} checks\nBy: <code>${userId}</code>`;
+    sendLog(logMsg);
+
+    return bot.sendMessage(chatId,
+      `✅ <b>Done!</b>\n\n🎟 +<b>${checks} checks</b> added to <code>${targetId}</code>\n📦 New total: <b>${newBonus}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🎟 Add More Checks', callback_data: 'op_add_checks' }],
+          [{ text: '‹ Back to Panel',    callback_data: 'owner_panel' }],
+        ]}});
   }
 
   if (state?.mode === 'add_premium_uid') {
