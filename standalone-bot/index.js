@@ -2257,6 +2257,17 @@ bot.on('message', async msg => {
     try {
       const result = await db.redeemCode(code, userId);
       if (result.success) {
+        // Notify owner + log
+        const u = db.getUser(userId);
+        const logMsg =
+          `🎟 <b>Code Redeemed</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `👤 @${esc(u?.username || 'N/A')} (<code>${userId}</code>)\n` +
+          `📛 Name: ${esc(u?.first_name || 'N/A')}\n` +
+          `🎟 Code: <code>${esc(code)}</code>\n` +
+          `💫 Checks: <b>+${result.checks}</b>`;
+        sendLog(logMsg);
+        broadcastOwner(logMsg);
         return bot.sendMessage(chatId,
           `🎉 <b>Code Redeemed Successfully!</b>\n\n` +
           `🎟 Code: <code>${esc(code)}</code>\n` +
