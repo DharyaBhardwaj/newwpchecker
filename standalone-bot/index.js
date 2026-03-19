@@ -152,7 +152,8 @@ async function wipeSession(accountId) {
 const MAX_RETRY = 50;
 
 async function connectAccount(accountId, accountType = 'checker') {
-  if (accounts.get(accountId)?.status === 'connected') return;
+  const existing = accounts.get(accountId);
+  if (existing?.status === 'connected' || existing?.status === 'connecting') return;
 
   db.addAccount(accountId, accountId, accountType);
   const dbAcct = db.getAccount(accountId);
@@ -241,11 +242,14 @@ async function connectAccount(accountId, accountType = 'checker') {
           return;
         }
 
-        // ✅ FIX: Auto-reconnect on disconnect — promotes backup if no checkers left
-        if (type === 'checker' && getConnectedCheckers().length === 0) {
-          sendLog(`⚠️ <b>Checker Disconnected</b>\n\nID: <code>${esc(accountId)}</code>\nNo checkers left — promoting backup...`);
-          broadcastOwner(`⚠️ <b>Checker Disconnected</b>\n\nID: <code>${esc(accountId)}</code>\nNo checkers left — promoting backup...`);
-          await promoteBackupAccount();
+        // Only notify/promote if we were previously connected (not on initial boot disconnect)
+        if (acct.wasConnected) {
+          if (type === 'checker' && getConnectedCheckers().length === 0) {
+            const dMsg = `⚠️ <b>Checker Disconnected</b>\n\nID: <code>${esc(accountId)}</code>\nNo checkers left — promoting backup...`;
+            sendLog(dMsg);
+            broadcastOwner(dMsg);
+            await promoteBackupAccount();
+          }
         }
 
         if (acct.retryCount < MAX_RETRY) {
@@ -257,6 +261,7 @@ async function connectAccount(accountId, accountType = 'checker') {
 
       if (connection === 'open') {
         acct.status      = 'connected';
+        acct.wasConnected = true;   // mark: this account has been connected at least once
         acct.qrCode      = null;
         acct.retryCount  = 0;
         acct.phoneNumber = sock.user?.id?.split(':')[0] || null;
