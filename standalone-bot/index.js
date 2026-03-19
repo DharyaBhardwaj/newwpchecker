@@ -3136,12 +3136,9 @@ bot.onText(/\/remprem (\d+)/, (msg, match) => {
 });
 bot.onText(/\/user (\d+)/, async (msg, match) => {
   if (!isAdmin(msg.from.id)) return;
-  const u = db.getUser(parseInt(match[1]));
-  if (!u) return bot.sendMessage(msg.chat.id, '❌ User not found.');
-  const prem = db.isPremiumActive(u.telegram_id);
-  bot.sendMessage(msg.chat.id,
-    `👤 <b>User Info</b>\n\n🆔 <code>${u.telegram_id}</code>\n@${esc(u.username)||'N/A'}\nRole: ${u.role}\nPremium: ${prem ? 'Yes' : 'No'}\nBlocked: ${u.is_blocked ? 'Yes' : 'No'}\nChecks: ${u.numbers_checked}`,
-    { parse_mode: 'HTML' });
+  const targetId = parseInt(match[1]);
+  // Use full handleUserInfo with all buttons
+  await handleUserInfo(msg.chat.id, msg.from.id, null, targetId);
 });
 
 // ════════════════════════════════════════════════════════════════════════════
