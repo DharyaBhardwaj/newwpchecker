@@ -1468,7 +1468,8 @@ async function showOwnerPanel(chatId, userId, msgId) {
     [{ text: '⚙️ Settings', callback_data: 'op_settings' }],
     [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
   ]};
-  return editMsg(chatId, msgId, opText, opKb);
+  // Always sendMessage — avoids silent fail on photo messages
+  return bot.sendMessage(chatId, opText, { parse_mode: 'HTML', reply_markup: opKb });
 }
 
 // ─── USER WA PANEL ───────────────────────────────────────────────────────────
