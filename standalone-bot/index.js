@@ -60,9 +60,6 @@ _fsubSqlite.exec(`CREATE TABLE IF NOT EXISTS fsub_channels (
   added_at TEXT DEFAULT CURRENT_TIMESTAMP
 );`);
 
-// Redeem codes table (uses same bot.db via db module's connection)
-// We add it via the existing db require
-db.initRedeemTable();
 const fsub = {
   getAll()               { return _fsubSqlite.prepare('SELECT * FROM fsub_channels ORDER BY id ASC').all(); },
   add(id, title, link)   { return _fsubSqlite.prepare('INSERT OR REPLACE INTO fsub_channels (channel_id,title,link) VALUES (?,?,?)').run(id, title||id, link||''); },
