@@ -3408,16 +3408,23 @@ const _apiKeys = new Map(); // key → { plan, daily_limit, used_today, reset_da
 async function loadApiKeys() {
   if (!supabase) return;
   try {
-    const { data } = await supabase.from('api_keys').select('*');
+    const { data, error } = await supabase.from('api_keys').select('*');
+    if (error) { console.error('[API Keys] Load error:', error.message); return; }
     (data || []).forEach(k => _apiKeys.set(k.key, k));
-  } catch (_) {}
+    console.log(`[API Keys] Loaded ${_apiKeys.size} keys from Supabase`);
+  } catch (e) {
+    console.error('[API Keys] Load exception:', e.message);
+  }
 }
 
 async function saveApiKey(keyObj) {
   if (!supabase) return;
   try {
-    await supabase.from('api_keys').upsert(keyObj, { onConflict: 'key' });
-  } catch (_) {}
+    const { error } = await supabase.from('api_keys').upsert(keyObj, { onConflict: 'key' });
+    if (error) console.error('[API Keys] Save error:', error.message);
+  } catch (e) {
+    console.error('[API Keys] Save exception:', e.message);
+  }
 }
 
 async function deleteApiKey(key) {
