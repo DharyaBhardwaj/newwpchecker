@@ -465,7 +465,7 @@ async function bulkCheck(numbers, onProgress) {
         results[idx] = await checkNumber(accountId, num);
         done++;
         if (onProgress) onProgress(done, numbers.length);
-        await sleep(50);
+        await sleep(100);
       }
       return fail;
     }));
@@ -1105,6 +1105,40 @@ bot.on('callback_query', async query => {
         `<code>Agency pro 90</code>   — Pro, 90 days\n` +
         `<code>Client business 0</code> — Business, no expiry\n`,
         backBtn);
+
+    case 'op_api_settings':
+      if (!isAdmin(userId)) return;
+      return showApiSettings(chatId, userId, msgId);
+
+    case 'set_api_rps_basic':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_api_rps_basic' });
+      return editMsg(chatId, msgId, `⚡ <b>Basic Plan RPS</b>\n\nCurrent: <code>${db.getSetting('api_rps_basic') || '3'}</code> req/sec\n\nSend new value:`, backBtn);
+
+    case 'set_api_rps_pro':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_api_rps_pro' });
+      return editMsg(chatId, msgId, `⚡ <b>Pro Plan RPS</b>\n\nCurrent: <code>${db.getSetting('api_rps_pro') || '5'}</code> req/sec\n\nSend new value:`, backBtn);
+
+    case 'set_api_rps_business':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_api_rps_business' });
+      return editMsg(chatId, msgId, `⚡ <b>Business Plan RPS</b>\n\nCurrent: <code>${db.getSetting('api_rps_business') || '10'}</code> req/sec\n\nSend new value:`, backBtn);
+
+    case 'set_api_bulk_basic':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_api_bulk_basic' });
+      return editMsg(chatId, msgId, `📦 <b>Basic Bulk Limit</b>\n\nCurrent: <code>${db.getSetting('api_bulk_basic') || '100'}</code>\n\nSend new value (0 = unlimited):`, backBtn);
+
+    case 'set_api_bulk_pro':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_api_bulk_pro' });
+      return editMsg(chatId, msgId, `📦 <b>Pro Bulk Limit</b>\n\nCurrent: <code>${db.getSetting('api_bulk_pro') || '500'}</code>\n\nSend new value (0 = unlimited):`, backBtn);
+
+    case 'set_api_bulk_business':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_api_bulk_business' });
+      return editMsg(chatId, msgId, `📦 <b>Business Bulk Limit</b>\n\nCurrent: <code>${db.getSetting('api_bulk_business') || '0 (unlimited)'}</code>\n\nSend new value (0 = unlimited):`, backBtn);
 
     case 'set_brand_channel':
       if (!isAdmin(userId)) return;
@@ -2198,6 +2232,32 @@ async function showRedeemPanel(chatId, userId, msgId) {
   return editMsg(chatId, msgId, body, kb);
 }
 
+// ─── API SETTINGS PANEL ──────────────────────────────────────────────────────
+async function showApiSettings(chatId, userId, msgId) {
+  if (!isAdmin(userId)) return;
+  const get = (k, d) => db.getSetting(k) || d;
+  const bulkFmt = v => v === '0' || v === 0 ? '∞ Unlimited' : v;
+  return editMsg(chatId, msgId,
+    `⚙️ <b>API Rate & Limit Settings</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `<b>⚡ Requests/Second (per key):</b>\n` +
+    `  💎 Basic:    <code>${get('api_rps_basic','3')}/sec</code>\n` +
+    `  👑 Pro:      <code>${get('api_rps_pro','5')}/sec</code>\n` +
+    `  🏢 Business: <code>${get('api_rps_business','10')}/sec</code>\n\n` +
+    `<b>📦 Bulk Check Limit (per request):</b>\n` +
+    `  💎 Basic:    <code>${bulkFmt(get('api_bulk_basic','100'))}</code>\n` +
+    `  👑 Pro:      <code>${bulkFmt(get('api_bulk_pro','500'))}</code>\n` +
+    `  🏢 Business: <code>${bulkFmt(get('api_bulk_business','0'))}</code>`,
+    { inline_keyboard: [
+      [{ text: '⚡ Basic RPS',    callback_data: 'set_api_rps_basic' },
+       { text: '⚡ Pro RPS',      callback_data: 'set_api_rps_pro' }],
+      [{ text: '⚡ Business RPS', callback_data: 'set_api_rps_business' }],
+      [{ text: '📦 Basic Bulk',    callback_data: 'set_api_bulk_basic' },
+       { text: '📦 Pro Bulk',      callback_data: 'set_api_bulk_pro' }],
+      [{ text: '📦 Business Bulk', callback_data: 'set_api_bulk_business' }],
+      [{ text: '‹ Back', callback_data: 'op_api_keys' }],
+    ]});
+}
+
 // ─── API KEYS PANEL ─────────────────────────────────────────────────────────
 async function showApiKeysPanel(chatId, userId, msgId) {
   if (!isAdmin(userId)) return;
@@ -2222,7 +2282,8 @@ async function showApiKeysPanel(chatId, userId, msgId) {
   for (const k of keys.slice(0, 8)) {
     rows.push([{ text: `🗑 Revoke: ${k.label}`, callback_data: `revoke_api_${k.key}` }]);
   }
-  rows.push([{ text: '➕ Create New Key', callback_data: 'op_create_api_key' }]);
+  rows.push([{ text: '➕ Create New Key', callback_data: 'op_create_api_key' },
+             { text: '⚙️ Rate Settings', callback_data: 'op_api_settings' }]);
   rows.push([{ text: '‹ Back', callback_data: 'owner_panel' }]);
   return editMsg(chatId, msgId, body, { inline_keyboard: rows });
 }
@@ -2508,7 +2569,7 @@ bot.on('message', async msg => {
         await bot.sendMessage(u.telegram_id, text, { parse_mode: 'HTML' });
         sent++;
       } catch (_) { failed++; }
-      await sleep(50);
+      await sleep(100);
     }
     logEvent(userId, username, 'Broadcast', `Sent: ${sent}, Failed: ${failed}`);
     return bot.editMessageText(`📢 <b>Broadcast Complete</b>\n\n✅ Sent: ${sent}\n❌ Failed: ${failed}`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML' });
@@ -2874,6 +2935,25 @@ bot.on('message', async msg => {
       `<i>⚠️ Keep your API key secret. Do not share publicly.</i>`,
       { parse_mode: 'HTML', disable_web_page_preview: true,
         reply_markup: { inline_keyboard: [[{ text: '🔑 View All Keys', callback_data: 'op_api_keys' }]] }});
+  }
+
+  for (const [mode, key, label] of [
+    ['set_api_rps_basic',    'api_rps_basic',    'Basic RPS'],
+    ['set_api_rps_pro',      'api_rps_pro',      'Pro RPS'],
+    ['set_api_rps_business', 'api_rps_business', 'Business RPS'],
+    ['set_api_bulk_basic',   'api_bulk_basic',   'Basic Bulk Limit'],
+    ['set_api_bulk_pro',     'api_bulk_pro',     'Pro Bulk Limit'],
+    ['set_api_bulk_business','api_bulk_business','Business Bulk Limit'],
+  ]) {
+    if (state?.mode === mode) {
+      userStates.delete(userId);
+      const v = parseInt(text.trim());
+      if (isNaN(v) || v < 0) return bot.sendMessage(chatId, '❌ Invalid. Send a number (0 = unlimited).');
+      db.setSetting(key, String(v));
+      return bot.sendMessage(chatId,
+        `✅ <b>${label}</b> set to <code>${v === 0 ? 'Unlimited' : v}</code>`,
+        { parse_mode: 'HTML' });
+    }
   }
 
   if (state?.mode === 'set_brand_channel') {
@@ -3548,6 +3628,26 @@ async function deleteApiKey(key) {
   _saveAllApiKeys();
 }
 
+// ─── PER-KEY RATE LIMITER (requests per second) ──────────────────────────
+const _rateWindows = new Map(); // key → { count, windowStart }
+
+function checkRateLimit(key, maxPerSecond = 3) {
+  const now = Date.now();
+  const w   = _rateWindows.get(key) || { count: 0, windowStart: now };
+
+  // Reset window every second
+  if (now - w.windowStart >= 1000) {
+    w.count       = 1;
+    w.windowStart = now;
+    _rateWindows.set(key, w);
+    return true;
+  }
+
+  w.count++;
+  _rateWindows.set(key, w);
+  return w.count <= maxPerSecond;
+}
+
 // ─── API KEY MIDDLEWARE ─────────────────────────────────────────────────────
 async function apiAuth(req, res, next) {
   const provided = req.headers['x-api-key'] || req.query.key;
@@ -3591,6 +3691,20 @@ async function apiAuth(req, res, next) {
   _apiKeys.set(provided, keyData);
   saveApiKey(keyData).catch(() => {});
 
+  // Per-second rate limit based on plan
+  const basicRps    = parseInt(db.getSetting('api_rps_basic')    || '3');
+  const proRps      = parseInt(db.getSetting('api_rps_pro')      || '5');
+  const businessRps = parseInt(db.getSetting('api_rps_business') || '10');
+  const rps    = { basic: basicRps, pro: proRps, business: businessRps };
+  const maxRps = rps[keyData.plan] || basicRps;
+  if (!checkRateLimit(provided, maxRps)) {
+    return res.status(429).json({
+      error:   'Too many requests. Slow down.',
+      limit:   `${maxRps} requests/second for ${keyData.plan} plan`,
+      retry_after: '1 second',
+    });
+  }
+
   req.apiPlan  = keyData.plan;
   req.apiLimit = keyData.daily_limit;
   req.apiKey   = keyData;
@@ -3628,14 +3742,32 @@ app.get('/WSCK', apiAuth, async (req, res) => {
 // ─── WSCK/bulk — Bulk Check ───────────────────────────────────────────────
 // POST /WSCK/bulk?key=YOUR_API_KEY
 // Body: { "phones": ["919876543210", "14155552671"] }
+// Concurrent bulk check limiter
+let _activeBulkJobs = 0;
+const MAX_CONCURRENT_BULK = 2;
+
 app.post('/WSCK/bulk', apiAuth, async (req, res) => {
   const phones = (req.body?.phones || []).map(p => String(p).replace(/[^0-9]/g, '')).filter(p => p.length >= 7 && p.length <= 15);
   if (!phones.length) return res.status(400).json({ success: false, error: 'Send { phones: [...] } in body.' });
-  const limit = parseInt(db.getSetting('api_bulk_limit') || '100');
-  if (phones.length > limit) return res.status(400).json({ success: false, error: `Max ${limit} numbers per request.` });
+  const plan       = req.apiKey?.plan || 'basic';
+  const bulkBasic  = parseInt(db.getSetting('api_bulk_basic')    || '100');
+  const bulkPro    = parseInt(db.getSetting('api_bulk_pro')      || '500');
+  const bulkBiz    = parseInt(db.getSetting('api_bulk_business') || '0'); // 0 = unlimited
+  const planLimits = { basic: bulkBasic, pro: bulkPro, business: bulkBiz };
+  const limit      = planLimits[plan] ?? bulkBasic;
+  if (limit > 0 && phones.length > limit) {
+    return res.status(400).json({ success: false, error: `Max ${limit} numbers per request for ${plan} plan.` });
+  }
   if (!getConnectedCheckers().length) return res.status(503).json({ success: false, error: 'No checkers connected.' });
+
+  // Too many concurrent bulk jobs
+  if (_activeBulkJobs >= MAX_CONCURRENT_BULK) {
+    return res.status(429).json({ success: false, error: 'Server busy. Try again in a moment.', retry_after: '5 seconds' });
+  }
+  _activeBulkJobs++;
   try {
     const results = await bulkCheck(phones);
+    _activeBulkJobs = Math.max(0, _activeBulkJobs - 1);
     const brandChannel2 = db.getSetting('brand_channel') || '@wachecke_r_bot';
     const brandName2    = db.getSetting('brand_name')    || 'WA Checker API';
     return res.json({
