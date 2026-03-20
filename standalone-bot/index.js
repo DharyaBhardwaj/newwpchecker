@@ -2784,18 +2784,31 @@ bot.on('message', async msg => {
     };
     _apiKeys.set(key, keyObj);
     await saveApiKey(keyObj);
-    const renderUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'newwpchecker.onrender.com'}`;
+    const renderUrl = process.env.API_PUBLIC_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'newwpchecker.onrender.com'}`;
     const expTxt    = expiresAt ? new Date(expiresAt).toLocaleDateString() : 'Never';
     const limitTxt  = planLimits[plan] >= 999999 ? 'Unlimited' : planLimits[plan].toLocaleString();
     return bot.sendMessage(chatId,
       `✅ <b>API Key Created!</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `👤 Label:  <b>${esc(label)}</b>\n` +
-      `📦 Plan:   <b>${plan}</b> (${limitTxt} req/day)\n` +
-      `📅 Expires: <b>${expTxt}</b>\n\n` +
-      `🔑 <b>Key:</b>\n<code>${key}</code>\n\n` +
-      `<b>Usage:</b>\n` +
-      `<code>${renderUrl}/WSCK?phone=91xxxxxxxxxx&key=${key}</code>\n\n` +
-      `<i>Share this key with your client. Keep it secret!</i>`,
+      `👤 <b>Label:</b>   ${esc(label)}\n` +
+      `📦 <b>Plan:</b>    ${plan} (${limitTxt} req/day)\n` +
+      `📅 <b>Expires:</b> ${expTxt}\n\n` +
+      `🔑 <b>API Key:</b>\n<code>${key}</code>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>📖 Usage Guide</b>\n\n` +
+      `<b>1️⃣ Single Check (GET):</b>\n` +
+      `<code>${renderUrl}/WSCK?phone=919876543210&key=${key}</code>\n\n` +
+      `<b>Response:</b>\n` +
+      `<code>{"success":true,"phone":"919876543210","is_registered":true}</code>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>2️⃣ Bulk Check (POST):</b>\n` +
+      `URL: <code>${renderUrl}/WSCK/bulk?key=${key}</code>\n` +
+      `Body: <code>{"phones":["919876543210","14155552671"]}</code>\n\n` +
+      `<b>cURL example:</b>\n` +
+      `<code>curl -X POST "${renderUrl}/WSCK/bulk?key=${key}" -H "Content-Type: application/json" -d "{\"phones\":[\"919876543210\",\"14155552671\"]}"</code>\n\n` +
+      `<b>Response:</b>\n` +
+      `<code>{"success":true,"registered":["919876543210"],"not_registered":["14155552671"]}</code>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<i>⚠️ Keep your API key secret. Do not share publicly.</i>`,
       { parse_mode: 'HTML', disable_web_page_preview: true,
         reply_markup: { inline_keyboard: [[{ text: '🔑 View All Keys', callback_data: 'op_api_keys' }]] }});
   }
@@ -3351,11 +3364,8 @@ bot.onText(/\/user (\d+)/, async (msg, match) => {
 
 app.get('/',       (_, res) => res.json({ status: 'running', name: 'WA Number Checker Bot' }));
 app.get('/health', (_, res) => {
-  res.json({
-    status:   'ok',
-    checkers: getConnectedCheckers().length,
-    accounts: db.getAllAccounts().map(a => ({ id: a.account_id, connected: !!a.is_connected, type: a.account_type })),
-  });
+  // Minimal response — don't expose internal details
+  res.json({ status: 'ok' });
 });
 
 // ─── API KEYS IN-MEMORY STORE (loaded from Supabase) ─────────────────────
