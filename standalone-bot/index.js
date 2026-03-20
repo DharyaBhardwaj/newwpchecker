@@ -1205,6 +1205,16 @@ bot.on('callback_query', async query => {
         `<i>Send <code>auto</code> as code name to generate randomly.</i>`,
         backBtn);
 
+    case 'tools_filter':
+      userStates.set(userId, { mode: 'filter_pending_file' });
+      return editMsg(chatId, msgId,
+        `🔍 <b>Filter Numbers by Ending Digits</b>\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `<b>Step 1:</b> Upload a <code>.txt</code> file with numbers\n` +
+        `<b>Step 2:</b> Send the ending digits to filter\n\n` +
+        `<b>Example:</b> filter <code>0247</code> → finds all numbers ending with 0247\n\n` +
+        `<i>Send your .txt file now:</i>`,
+        backBtn);
+
     case 'tools_upload':
       userStates.set(userId, { mode: 'upload' });
       return editMsg(chatId, msgId,
@@ -1320,6 +1330,7 @@ async function showTools(chatId, userId, msgId) {
     { inline_keyboard: [
       [{ text: '📤 Upload Numbers', callback_data: 'tools_upload' }],
       [{ text: '🎲 Get Next Number', callback_data: 'tools_get' }, { text: '⏭ Skip / Next', callback_data: 'tools_change' }],
+      [{ text: '🔍 Filter by Ending Digits', callback_data: 'tools_filter' }],
       [{ text: '‹ Back to Menu', callback_data: 'main_menu' }],
     ]});
 }
@@ -2978,6 +2989,36 @@ bot.on('message', async msg => {
       { parse_mode: 'HTML' });
   }
 
+  if (state?.mode === 'filter_digits') {
+    userStates.delete(userId);
+    const digits = text.trim().replace(/\D/g, '');
+    if (!digits) return bot.sendMessage(chatId, '❌ Send digits only. Example: <code>0247</code>', { parse_mode: 'HTML' });
+    const numbers = state.numbers || [];
+    const found   = numbers.filter(n => n.endsWith(digits));
+    if (!found.length) {
+      return bot.sendMessage(chatId,
+        `🔍 <b>No matches found</b>\n\nNo numbers ending with <code>${esc(digits)}</code> in the uploaded file.\n\n<i>Total numbers checked: ${numbers.length}</i>`,
+        { parse_mode: 'HTML' });
+    }
+    // Send results
+    const resultTxt = found.join('\n');
+    if (found.length <= 20) {
+      return bot.sendMessage(chatId,
+        `✅ <b>Found ${found.length} number(s) ending with <code>${esc(digits)}</code>:</b>\n\n` +
+        found.map(n => `<code>${esc(n)}</code>`).join('\n'),
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '‹ Back to Tools', callback_data: 'tools' }]] }});
+    } else {
+      // Too many — send as file
+      const buf = Buffer.from(resultTxt, 'utf-8');
+      await bot.sendDocument(chatId, buf,
+        { caption: `✅ <b>Found ${found.length} numbers ending with <code>${esc(digits)}</code></b>\nFrom ${numbers.length} total numbers.`,
+          parse_mode: 'HTML' },
+        { filename: `filtered_${digits}.txt`, contentType: 'text/plain' });
+      return;
+    }
+  }
+
   if (state?.mode === 'upload') {
     const nums = text.split(/[\n,\s]+/).filter(n => /^\d{7,15}$/.test(n.replace(/\D/g,'')));
     if (!nums.length) return bot.sendMessage(chatId, '❌ No valid numbers found.');
@@ -3136,6 +3177,46 @@ bot.on('document', async msg => {
       `<i>Share this code with users.</i>`,
       { parse_mode: 'HTML' });
   }
+
+  if (state?.mode === 'filter_digits') {
+    userStates.delete(userId);
+    const digits = text.trim().replace(/\D/g, '');
+    if (!digits) return bot.sendMessage(chatId, '❌ Send digits only. Example: <code>0247</code>', { parse_mode: 'HTML' });
+    const numbers = state.numbers || [];
+    const found   = numbers.filter(n => n.endsWith(digits));
+    if (!found.length) {
+      return bot.sendMessage(chatId,
+        `🔍 <b>No matches found</b>\n\nNo numbers ending with <code>${esc(digits)}</code> in the uploaded file.\n\n<i>Total numbers checked: ${numbers.length}</i>`,
+        { parse_mode: 'HTML' });
+    }
+    // Send results
+    const resultTxt = found.join('\n');
+    if (found.length <= 20) {
+      return bot.sendMessage(chatId,
+        `✅ <b>Found ${found.length} number(s) ending with <code>${esc(digits)}</code>:</b>\n\n` +
+        found.map(n => `<code>${esc(n)}</code>`).join('\n'),
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '‹ Back to Tools', callback_data: 'tools' }]] }});
+    } else {
+      // Too many — send as file
+      const buf = Buffer.from(resultTxt, 'utf-8');
+      await bot.sendDocument(chatId, buf,
+        { caption: `✅ <b>Found ${found.length} numbers ending with <code>${esc(digits)}</code></b>\nFrom ${numbers.length} total numbers.`,
+          parse_mode: 'HTML' },
+        { filename: `filtered_${digits}.txt`, contentType: 'text/plain' });
+      return;
+    }
+  }
+
+  if (state?.mode === 'filter_pending_file') {
+      // File received — now ask for digits
+      userStates.set(userId, { mode: 'filter_digits', numbers: nums.map(n => n.replace(/\D/g,'')) });
+      return bot.sendMessage(chatId,
+        `✅ <b>File received!</b> ${nums.length} numbers loaded.\n\n` +
+        `Now send the <b>ending digits</b> to filter:\n` +
+        `Example: <code>0247</code> or <code>88</code> or <code>999</code>`,
+        { parse_mode: 'HTML' });
+    }
 
   if (state?.mode === 'upload') {
       userStates.delete(userId);
