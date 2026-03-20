@@ -242,53 +242,68 @@ async function connectAccount(accountId, accountType = 'checker') {
           return;
         }
 
-        // Only notify/promote if we were previously connected (not on initial boot disconnect)
+        // Notify owner whenever any account disconnects
         if (acct.wasConnected) {
-          if (type === 'checker' && getConnectedCheckers().length === 0) {
-            const dMsg = `⚠️ <b>Checker Disconnected</b>\n\nID: <code>${esc(accountId)}</code>\nNo checkers left — promoting backup...`;
+          const connectedCheckers = getConnectedCheckers();
+          const phone = acct.phoneNumber ? `+${acct.phoneNumber}` : accountId;
+          if (type === 'checker' && connectedCheckers.length === 0) {
+            const dMsg =
+              `🔴 <b>Account Disconnected — No Checkers Left!</b>\n\n` +
+              `📱 <code>${esc(phone)}</code> (<code>${esc(accountId)}</code>)\n` +
+              `⚠️ Promoting backup account...`;
             sendLog(dMsg);
             broadcastOwner(dMsg);
             await promoteBackupAccount();
+          } else {
+            const dMsg =
+              `⚠️ <b>Account Disconnected</b>\n\n` +
+              `📱 <code>${esc(phone)}</code> (<code>${esc(accountId)}</code>)\n` +
+              `✅ ${connectedCheckers.length} checker(s) still active`;
+            sendLog(dMsg);
+            broadcastOwner(dMsg);
           }
+          acct.wasConnected = false;
         }
 
         if (acct.retryCount < MAX_RETRY) {
           acct.retryCount++;
-          const backoff = Math.min(30_000, 2_000 * acct.retryCount);
+          // Backoff: 30s, 60s, 90s... max 5 min — prevents spam reconnect
+          const backoff = Math.min(300_000, 30_000 * acct.retryCount);
           acct.retryTimer = setTimeout(() => connectAccount(accountId, type), backoff);
         }
       }
 
       if (connection === 'open') {
-        acct.status      = 'connected';
-        acct.wasConnected = true;   // mark: this account has been connected at least once
-        acct.qrCode      = null;
-        acct.retryCount  = 0;
-        acct.phoneNumber = sock.user?.id?.split(':')[0] || null;
+        const firstConnect = !acct.wasConnected;
+        acct.status       = 'connected';
+        acct.wasConnected = true;
+        acct.qrCode       = null;
+        acct.retryCount   = 0;
+        acct.phoneNumber  = sock.user?.id?.split(':')[0] || null;
         db.setAccountConnected(accountId, true, acct.phoneNumber);
         await saveSession(accountId);
-        // Check if this is a user-submitted account
-        const isUserAcct = accountId.startsWith('user_');
-        let connMsg;
-        if (isUserAcct) {
-          const ownerUserId = accountId.replace('user_', '');
-          const u = db.getUser(parseInt(ownerUserId));
-          connMsg =
-            `✅ <b>User WA Connected</b>\n` +
-            `👤 @${esc(u?.username || ownerUserId)} (<code>${ownerUserId}</code>)\n` +
-            `📱 Number: <code>+${acct.phoneNumber}</code>`;
-          // Notify the user too
-          bot.sendMessage(parseInt(ownerUserId),
-            `✅ <b>WhatsApp Connected!</b>\n\n` +
-            `📱 <code>+${acct.phoneNumber}</code>\n\n` +
-            `<i>Your account is now active and helping check numbers.</i>`,
-            { parse_mode: 'HTML' }
-          ).catch(() => {});
-        } else {
-          connMsg = `✅ <b>Account Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>+${acct.phoneNumber}</code>\nType: <code>${type}</code>`;
+
+        // Only notify on FIRST connect or after a real disconnect (not auto-reconnect spam)
+        if (firstConnect) {
+          const isUserAcct = accountId.startsWith('user_');
+          if (isUserAcct) {
+            const ownerUserId = accountId.replace('user_', '');
+            const u = db.getUser(parseInt(ownerUserId));
+            const connMsg =
+              `✅ <b>User WA Connected</b>\n` +
+              `👤 @${esc(u?.username || ownerUserId)} (<code>${ownerUserId}</code>)\n` +
+              `📱 <code>+${acct.phoneNumber}</code>`;
+            sendLog(connMsg);
+            broadcastOwner(connMsg);
+            bot.sendMessage(parseInt(ownerUserId),
+              `✅ <b>WhatsApp Connected!</b>\n\n📱 <code>+${acct.phoneNumber}</code>\n\n<i>Your account is now active.</i>`,
+              { parse_mode: 'HTML' }).catch(() => {});
+          } else {
+            const connMsg = `✅ <b>Account Connected</b>\n\nID: <code>${esc(accountId)}</code>\nPhone: <code>+${acct.phoneNumber}</code>\nType: <code>${type}</code>`;
+            sendLog(connMsg);
+            broadcastOwner(connMsg);
+          }
         }
-        sendLog(connMsg);
-        broadcastOwner(connMsg);
       }
     });
 
@@ -394,10 +409,13 @@ async function checkNumber(accountId, phone) {
 // ─── LOAD-BALANCED BULK CHECK ─────────────────────────────────────────────
 async function checkSingleNumber(accountId, phone) {
   const acct = accounts.get(accountId);
-  if (!acct?.sock) return { phone_number: phone, is_registered: null };
+  if (!acct?.sock || acct.status !== 'connected')
+    return { phone_number: phone, is_registered: null, error: 'not_connected' };
   try {
-    const [result] = await acct.sock.onWhatsApp(phone);
-    return { phone_number: phone, is_registered: result?.exists ?? false };
+    const num      = phone.replace(/\D/g, '');
+    const [result] = await acct.sock.onWhatsApp(`${num}@s.whatsapp.net`);
+    db.incrementAccountChecks(accountId);
+    return { phone_number: phone, is_registered: result?.exists === true };
   } catch (e) {
     return { phone_number: phone, is_registered: null, error: e.message };
   }
