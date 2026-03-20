@@ -7,6 +7,9 @@
 
 const express    = require('express');
 const TelegramBot = require('node-telegram-bot-api');
+// Memory optimization — request GC when possible
+if (global.gc) { setInterval(() => { try { global.gc(); } catch(_) {} }, 60_000); }
+
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const {
   useMultiFileAuthState, DisconnectReason,
@@ -151,6 +154,15 @@ async function wipeSession(accountId) {
 // ─── CONNECT ONE ACCOUNT ──────────────────────────────────────────────────
 const MAX_RETRY = 50;
 
+// Cache Baileys version — avoid repeated network calls
+let _baileysVersion = null;
+async function getBaileysVersion() {
+  if (_baileysVersion) return _baileysVersion;
+  const { version } = await fetchLatestBaileysVersion();
+  _baileysVersion = version;
+  return version;
+}
+
 async function connectAccount(accountId, accountType = 'checker') {
   const existing = accounts.get(accountId);
   if (existing?.status === 'connected' || existing?.status === 'connecting') return;
@@ -172,7 +184,7 @@ async function connectAccount(accountId, accountType = 'checker') {
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(dir);
-    const { version }          = await fetchLatestBaileysVersion();
+    const version              = await getBaileysVersion();
 
     const sock = makeWASocket({
       version,
@@ -181,14 +193,18 @@ async function connectAccount(accountId, accountType = 'checker') {
         creds: state.creds,
         keys:  makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
       },
-      printQRInTerminal:          false,
-      browser:                    ['Ubuntu', 'Chrome', '20.0.04'],
+      printQRInTerminal:              false,
+      browser:                        ['Ubuntu', 'Chrome', '20.0.04'],
       generateHighQualityLinkPreview: false,
-      syncFullHistory:            false,
-      markOnlineOnConnect:        false,
-      keepAliveIntervalMs:        30_000,
-      connectTimeoutMs:           60_000,
-      defaultQueryTimeoutMs:      60_000,
+      syncFullHistory:                false,
+      markOnlineOnConnect:            false,
+      keepAliveIntervalMs:            45_000,
+      connectTimeoutMs:               60_000,
+      defaultQueryTimeoutMs:          30_000,
+      // Memory optimizations
+      getMessage:                     async () => undefined,
+      shouldIgnoreJid:                jid => !jid.endsWith('@s.whatsapp.net'),
+      retryRequestDelayMs:            2000,
     });
 
     accounts.get(accountId).sock = sock;
