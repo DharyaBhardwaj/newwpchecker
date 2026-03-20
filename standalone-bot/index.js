@@ -1106,6 +1106,20 @@ bot.on('callback_query', async query => {
         `<code>Client business 0</code> — Business, no expiry\n`,
         backBtn);
 
+    case 'set_brand_channel':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_brand_channel' });
+      return editMsg(chatId, msgId,
+        `📢 <b>Set Brand Channel</b>\n\nCurrent: <code>${db.getSetting('brand_channel') || 'Not set'}</code>\n\nSend your channel username:\n<i>e.g. @mychannel</i>`,
+        backBtn);
+
+    case 'set_brand_name':
+      if (!isAdmin(userId)) return;
+      userStates.set(userId, { mode: 'set_brand_name' });
+      return editMsg(chatId, msgId,
+        `🏷 <b>Set Brand Name</b>\n\nCurrent: <code>${db.getSetting('brand_name') || 'WA Checker API'}</code>\n\nSend your brand name:\n<i>e.g. MyChecker API</i>`,
+        backBtn);
+
     case 'set_api_key':
       if (!isAdmin(userId)) return;
       userStates.set(userId, { mode: 'set_api_key' });
@@ -2228,7 +2242,9 @@ async function showBotSettings(chatId, userId, msgId) {
     `👑 <b>VIP Bulk:</b>  <code>${db.getSetting('vip_bulk') || '1000'}</code>\n` +
     `🖼 <b>Menu image:</b> ${menuImg ? '✅ Set' : '❌ Not set'}\n` +
     `💳 <b>UPI ID:</b>  <code>${db.getSetting('upi_id') || 'Not set'}</code>\n` +
-    `🔑 <b>API Key:</b>  <code>${db.getSetting('api_key') ? '✅ Set' : '❌ Not set'}</code>`,
+    `🔑 <b>API Key:</b>     <code>${db.getSetting('api_key') ? '✅ Set' : '❌ Not set'}</code>\n` +
+    `📢 <b>Brand Channel:</b> <code>${db.getSetting('brand_channel') || 'Not set'}</code>\n` +
+    `🏷 <b>Brand Name:</b>   <code>${db.getSetting('brand_name') || 'WA Checker API'}</code>`,
     { inline_keyboard: [
       [{ text: mode==='public'?'✅ Public':'⬜ Public', callback_data:'set_public' },
        { text: mode==='private'?'✅ Private':'⬜ Private', callback_data:'set_private' }],
@@ -2240,6 +2256,8 @@ async function showBotSettings(chatId, userId, msgId) {
        { text: '💎 Premium Limit', callback_data:'set_prem_limit' }],
       [{ text: '📁 Bulk Limit', callback_data:'set_bulk_limit' },
        { text: '🔗 Refer Bonus', callback_data:'set_refer_bonus' }],
+      [{ text: '📢 Brand Channel', callback_data: 'set_brand_channel' },
+       { text: '🏷 Brand Name',    callback_data: 'set_brand_name' }],
       [{ text: '🔑 Set API Key', callback_data: 'set_api_key' }],
       [{ text: '💳 Set UPI ID', callback_data: 'set_upi_id' }],
       [{ text: '👑 VIP Daily Limit', callback_data: 'set_vip_limit' },
@@ -2845,6 +2863,19 @@ bot.on('message', async msg => {
       `<i>⚠️ Keep your API key secret. Do not share publicly.</i>`,
       { parse_mode: 'HTML', disable_web_page_preview: true,
         reply_markup: { inline_keyboard: [[{ text: '🔑 View All Keys', callback_data: 'op_api_keys' }]] }});
+  }
+
+  if (state?.mode === 'set_brand_channel') {
+    userStates.delete(userId);
+    const ch = text.trim().startsWith('@') ? text.trim() : '@' + text.trim();
+    db.setSetting('brand_channel', ch);
+    return bot.sendMessage(chatId, `✅ Brand channel set to <code>${esc(ch)}</code>`, { parse_mode: 'HTML' });
+  }
+
+  if (state?.mode === 'set_brand_name') {
+    userStates.delete(userId);
+    db.setSetting('brand_name', text.trim());
+    return bot.sendMessage(chatId, `✅ Brand name set to <b>${esc(text.trim())}</b>`, { parse_mode: 'HTML' });
   }
 
   if (state?.mode === 'set_api_key') {
@@ -3499,11 +3530,14 @@ app.get('/WSCK', apiAuth, async (req, res) => {
   try {
     const checker = checkers[Math.floor(Math.random() * checkers.length)];
     const result  = await checkSingleNumber(checker.account_id, phone);
+    const brandChannel = db.getSetting('brand_channel') || '@wachecke_r_bot';
+    const brandName    = db.getSetting('brand_name')    || 'WA Checker API';
     return res.json({
       success:       true,
       phone:         phone,
       is_registered: result?.is_registered ?? null,
       checked_at:    new Date().toISOString(),
+      powered_by:    `${brandName} | Telegram: ${brandChannel}`,
     });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
@@ -3521,13 +3555,16 @@ app.post('/WSCK/bulk', apiAuth, async (req, res) => {
   if (!getConnectedCheckers().length) return res.status(503).json({ success: false, error: 'No checkers connected.' });
   try {
     const results = await bulkCheck(phones);
+    const brandChannel2 = db.getSetting('brand_channel') || '@wachecke_r_bot';
+    const brandName2    = db.getSetting('brand_name')    || 'WA Checker API';
     return res.json({
-      success:    true,
-      total:      results.length,
-      registered: results.filter(r => r?.is_registered === true).map(r => r.phone_number),
+      success:        true,
+      total:          results.length,
+      registered:     results.filter(r => r?.is_registered === true).map(r => r.phone_number),
       not_registered: results.filter(r => r?.is_registered === false).map(r => r.phone_number),
-      unknown:    results.filter(r => r?.is_registered === null).map(r => r.phone_number),
-      checked_at: new Date().toISOString(),
+      unknown:        results.filter(r => r?.is_registered === null).map(r => r.phone_number),
+      checked_at:     new Date().toISOString(),
+      powered_by:     `${brandName2} | Telegram: ${brandChannel2}`,
     });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
